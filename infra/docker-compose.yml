@@ -1,0 +1,238 @@
+name: phm-lakehouse
+
+services:
+  # ─────────────────────────────────────────────
+  # MinIO — S3 호환 오브젝트 스토리지 (Iceberg warehouse)
+  # ─────────────────────────────────────────────
+  minio:
+    image: minio/minio:RELEASE.2024-10-13T13-34-11Z
+    container_name: phm-minio
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Console
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-admin}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-admin12345}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: [phm]
+
+  # MinIO 초기화 — warehouse 버킷 생성
+  minio-init:
+    image: minio/mc:RELEASE.2024-10-08T09-37-26Z
+    container_name: phm-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    # 일회성 부트스트랩 — Exited(0) 후 재기동 안 함.
+    restart: "no"
+    environment:
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-admin}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-admin12345}
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $$S3_ACCESS_KEY $$S3_SECRET_KEY;
+      mc mb -p local/warehouse || true;
+      exit 0;
+      "
+    networks: [phm]
+
+  # ─────────────────────────────────────────────
+  # Iceberg REST Catalog (HMS 대체 — arm64 네이티브, 단일 컨테이너)
+  # ─────────────────────────────────────────────
+  iceberg-rest:
+    image: tabulario/iceberg-rest:1.6.0
+    container_name: phm-iceberg-rest
+    depends_on:
+      minio:
+        condition: service_healthy
+    ports:
+      - "8181:8181"
+    environment:
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-admin}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-admin12345}
+      AWS_REGION: ${S3_REGION:-us-east-1}
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      # 메타 영속화 — 기본값(in-memory SQLite)을 file 기반으로 override.
+      # 컨테이너 재기동 시 카탈로그 ↔ S3 inconsistency 방지.
+      CATALOG_URI: jdbc:sqlite:file:/var/lib/iceberg-rest/catalog.db
+    volumes:
+      - iceberg-rest-data:/var/lib/iceberg-rest
+    healthcheck:
+      # eclipse-temurin 베이스에 bash 가 있어 /dev/tcp 사용 가능.
+      test: ["CMD", "bash", "-c", "echo > /dev/tcp/127.0.0.1/8181"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
+    networks: [phm]
+
+  # ─────────────────────────────────────────────
+  # Spark — 적재·정제·MERGE·컴팩션
+  # ─────────────────────────────────────────────
+  spark:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    image: phm/spark:3.5.3-iceberg
+    container_name: phm-spark
+    depends_on:
+      iceberg-rest:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    ports:
+      - "4040:4040"   # Spark Driver UI (job 실행 중)
+      # 모든 spark-submit 이 --master local[*] 로 도므로 Standalone Master UI(8080) 는 미사용 → 노출 안 함.
+    environment:
+      SPARK_MODE: master
+      # AWS SDK v1 (S3A) + v2 (Iceberg S3FileIO) 둘 다 env 기반 credential chain 으로 resolve.
+      # spark-defaults.conf 에서는 endpoint·path-style 만 지정하고, 자격증명은 여기 env 로만 주입.
+      AWS_REGION: ${S3_REGION:-us-east-1}
+      AWS_DEFAULT_REGION: ${S3_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-admin}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-admin12345}
+      AWS_ENDPOINT_URL_S3: http://minio:9000
+    volumes:
+      - ./conf/spark/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - ../code:/workspace/code:ro
+      - ../experiments:/workspace/experiments:ro
+      - ../data:/workspace/data
+    command: >
+      bash -c "
+      /opt/spark/sbin/start-master.sh &&
+      tail -f /opt/spark/logs/*.out
+      "
+    networks: [phm]
+
+  # ─────────────────────────────────────────────
+  # Trino — Iceberg SQL 쿼리 엔진 (Athena 대체)
+  # ─────────────────────────────────────────────
+  trino:
+    image: trinodb/trino:455
+    container_name: phm-trino
+    depends_on:
+      iceberg-rest:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      # iceberg.properties 의 ${ENV:...} 가 이 값들을 읽음.
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-admin}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-admin12345}
+      AWS_REGION: ${S3_REGION:-us-east-1}
+    volumes:
+      - ./conf/trino/catalog:/etc/trino/catalog:ro
+    networks: [phm]
+
+  # ─────────────────────────────────────────────
+  # Kafka — 센서 스트림 시뮬레이션
+  # ─────────────────────────────────────────────
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: phm-kafka
+    ports:
+      # 9092 (PLAINTEXT) 는 docker network 내부 통신 전용 → 호스트 노출 안 함.
+      # 호스트/외부 클라이언트는 9094 (EXTERNAL) 사용.
+      - "9094:9094"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      CLUSTER_ID: "phm-kafka-cluster-001"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      # apache/kafka 는 alpine 베이스 — busybox nc 로 broker 포트 확인.
+      test: ["CMD-SHELL", "nc -z localhost 9092 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
+    networks: [phm]
+
+  # ─────────────────────────────────────────────
+  # Airflow — DAG 오케스트레이션 (standalone 모드, SQLite + SequentialExecutor)
+  # 호스트 docker.sock 마운트 → BashOperator 가 `docker exec phm-spark ...` 호출.
+  # ─────────────────────────────────────────────
+  airflow:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    image: phm/airflow:2.10.3-docker-cli
+    container_name: phm-airflow
+    user: "0:0"  # docker.sock 접근 위해 root
+    ports:
+      - "8085:8080"  # Airflow UI (Spark Master 8090, Trino 8080 회피)
+    environment:
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/airflow.db
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${AIRFLOW_ADMIN_USER:-admin}
+      _AIRFLOW_WWW_USER_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-admin}
+    volumes:
+      - ../orchestration/dags:/opt/airflow/dags:ro
+      - ../code:/opt/airflow/code:ro
+      - airflow-data:/opt/airflow
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: ["airflow", "standalone"]
+    networks: [phm]
+
+  # ─────────────────────────────────────────────
+  # Superset — BI 대시보드
+  # ─────────────────────────────────────────────
+  superset:
+    image: apache/superset:4.1.1
+    container_name: phm-superset
+    ports:
+      - "8088:8088"
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY:-phm-local-dev-secret-change-me}
+      SUPERSET_ADMIN_USER: ${SUPERSET_ADMIN_USER:-admin}
+      SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD:-admin}
+    command: >
+      bash -c "
+      pip install trino sqlalchemy-trino &&
+      superset db upgrade &&
+      superset fab create-admin --username \"$$SUPERSET_ADMIN_USER\" --firstname A --lastname D --email a@b.c --password \"$$SUPERSET_ADMIN_PASSWORD\" &&
+      superset init &&
+      superset run -h 0.0.0.0 -p 8088
+      "
+    volumes:
+      - superset-data:/app/superset_home
+    networks: [phm]
+
+volumes:
+  minio-data:
+  kafka-data:
+  superset-data:
+  airflow-data:
+  iceberg-rest-data:
+
+networks:
+  phm:
+    driver: bridge

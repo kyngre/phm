@@ -1,0 +1,4 @@
+-- Iceberg 네임스페이스 (메달리온 3계층)
+CREATE NAMESPACE IF NOT EXISTS phm.bronze;
+CREATE NAMESPACE IF NOT EXISTS phm.silver;
+CREATE NAMESPACE IF NOT EXISTS phm.gold;

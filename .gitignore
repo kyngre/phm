@@ -1,0 +1,28 @@
+# Data
+data/raw/
+data/warehouse/
+data/_checkpoints/
+data/_logs/
+*.parquet
+*.crc
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Spark / Iceberg
+spark-warehouse/
+metastore_db/
+derby.log
+
+# IDE
+.idea/
+.vscode/
+.DS_Store
+
+# Secrets
+.env
+*.pem
