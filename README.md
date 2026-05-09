@@ -52,8 +52,8 @@ event_ts = base_date  +  unit_jitter × unit_id  +  interval × (cycle − 1)
 **왜 분리했나** — `event_ts` 는 **데이터 시간** (시뮬 도메인), `ingest_ts` / 발행 페이싱은 **메타 시간** (실시간 적재). Iceberg time-travel 의 두 시간 축 (`AS OF snapshot` vs `WHERE event_ts BETWEEN`) 을 모두 시연 가능.
 
 **산출 분포** (default 인자, FD001~FD004 전체):
-- event_ts span: 2025-08-01 ~ 2025-08-26 (약 25일, FD002 의 unit_jitter 누적 + FD004 의 max cycle 영향)
-- 일자 분산: 25 × 4 dataset = 100 day 파티션
+- event_ts span: 2025-08-01 ~ 2025-09-03 (약 33일, FD004 max unit≈249 × 1h + max cycle≈543 × 1h = 791h)
+- 일자 분산: 약 33 × 4 dataset = ~130 day 파티션 (dataset 별 span 상이: FD001≈19일, FD002≈27일, FD003≈26일, FD004≈33일)
 - 멱등: 같은 인자로 재시뮬 → bit-identical Silver/Gold
 
 **대안 시나리오**:
@@ -72,7 +72,7 @@ event_ts = base_date  +  unit_jitter × unit_id  +  interval × (cycle − 1)
 **핵심 KPI**
 1. **Fleet 위험도 지표** — RUL ≤ 30 cycle 엔진 비율 (조기 경보 커버리지)
 2. **예측 정확도** — RUL MAE / PHM08 Score (학술 표준 지표)
-3. **데이터 신선도 & 운영 안정성** — 센서 dropout 시간, MERGE 충돌율, 컴팩션 후 평균 파일 크기
+3. **데이터 신선도 & 운영 안정성** — 센서 dropout 시간, MERGE commit 패턴(replace 비율·추가 행수; OCC 충돌은 Spark log에서 확인), 컴팩션 후 평균 파일 크기
 
 ---
 
@@ -149,7 +149,7 @@ event_ts = base_date  +  unit_jitter × unit_id  +  interval × (cycle − 1)
 1. 엔진별 마지막 cycle 도착 시각 (센서 dropout 감지)
 2. `dataset_id × condition` 별 일자 행 수 추이
 3. 작은 파일(<128MB) 비율 (Iceberg `files` 메타)
-4. snapshot 증가율 (`history` / `snapshots`)
+4. snapshot 증가율 (`$snapshots` 메타테이블)
 5. RUL 예측 MAE drift (Gold)
 6. Silver MERGE 충돌·재시도 카운트
 7. 운영조건 클러스터 분포 변화 (data drift)
@@ -159,10 +159,10 @@ event_ts = base_date  +  unit_jitter × unit_id  +  interval × (cycle − 1)
 
 ## 6. 대시보드
 
-`dashboard/` 스크린샷 참조.
+`dashboard/` — Superset export zip(`dashboard_export_biz.zip`, `dashboard_export_ops.zip`) 포함. 스크린샷은 미첨부.
 
 - **비즈니스 탭**: fleet RUL 히스토그램, 위험 엔진 Top 10, 운영조건별 열화율, 정비 권고 큐
-- **운영 탭**: 데이터 신선도, 행 수/파일 수/평균 크기, snapshot 추이, 컴팩션 전후 비교, MERGE 충돌
+- **운영 탭**: 데이터 신선도, 행 수/파일 수/평균 크기, snapshot 추이, 컴팩션 전후 비교, MERGE commit 패턴(replace 비율)
 
 ---
 
@@ -172,9 +172,9 @@ event_ts = base_date  +  unit_jitter × unit_id  +  interval × (cycle − 1)
 |---|---|
 | Single Spark Streaming Job | Kafka 파티션 수 ↑ + Spark executor 수평 확장, dataset_id 별 job 분리 |
 | 작은 파일 폭증 | 컴팩션 빈도 ↑ + `write.target-file-size-bytes` 튜닝, partial-progress 활성화 |
-| 메타 카탈로그 부하 | Glue → Nessie/REST catalog 검토 |
+| 메타 카탈로그 부하 | 현재 단일 REST Catalog 컨테이너 → Nessie 등 분산·HA 카탈로그로 전환 검토 |
 | 백필 비용 | Silver `days(event_ts)` 파티션 활용 + month 단위로 더 잘게 쪼개기 (`months(event_ts)`) |
-| 모델 서빙 | 배치 → 온라인 서빙(SageMaker/Triton), Gold에 `prediction_ts` 멱등 키 |
+| 모델 서빙 | 배치 → 온라인 서빙(SageMaker/Triton), Gold에 `predict_ts` 컬럼 추가·`(model_version, dataset_id, unit_id, cycle)` 멱등 키 유지 |
 
 ---
 
@@ -191,14 +191,14 @@ event_ts = base_date  +  unit_jitter × unit_id  +  interval × (cycle − 1)
 
 - **Bronze**: `(source_file, line_no)` 유니크 → 재적재 안전.
 - **Silver**: `MERGE INTO ... ON (dataset_id, unit_id, cycle)` — 같은 입력 N회 적용해도 동일 결과.
-- **Gold**: `(model_version, unit_id, prediction_ts)` 키, time-travel로 과거 예측 재현.
+- **Gold**: `(model_version, dataset_id, unit_id, cycle)` 키, `predict_ts` + `silver_snapshot_id` 기록으로 time-travel 재현.
 - **백필 절차**: ① Silver snapshot 태그 → ② 백필 실행 → ③ 실패 시 `ROLLBACK TO TAG`.
 
 ---
 
 ## 10. PHM Korea 학회 기여 포인트
 
-`paper/` 디렉토리 참조.
+`paper/outline.md` 참조 (초안 목차 단계).
 
 1. **재현 가능한 PHM MLOps 레퍼런스 아키텍처** — 데이터 레이크하우스 ↔ 모델 서빙 ↔ 운영 가시성 통합 사례.
 2. **모델 vs 데이터 드리프트 분리 모니터링** — Iceberg snapshot 메타 활용.

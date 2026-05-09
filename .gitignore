@@ -22,6 +22,10 @@ derby.log
 .idea/
 .vscode/
 .DS_Store
+**/.DS_Store
+
+# Claude Code
+.claude/
 
 # Secrets
 .env
