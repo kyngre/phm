@@ -5,7 +5,7 @@
 -- 변환:
 --   1) 결측·이상치 제거, 분산 0인 센서(1,5,6,10,16,18,19) 제외
 --   2) op_setting 1~3 기반 K-means 6 cluster (FD002/004 6 condition)
---   3) Health Index (PCA 기반, 외부에서 계산해 적재)
+--   3) Health Index = 1 - min(|s_avg_w5|, 3) / 3  (cluster 평균 대비 편차 기반; 0=열화, 1=정상)
 --   4) rolling window (5 cycle) 평균/표준편차/추세
 -- 멱등 MERGE 키: (dataset_id, unit_id, cycle)
 -- ─────────────────────────────────────────────────────────────

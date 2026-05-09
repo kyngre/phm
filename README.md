@@ -16,6 +16,8 @@
 | `test_FD00x.txt` | partial trajectory (평가) | 13K~41K | 동일 |
 | `RUL_FD00x.txt` | test 의 마지막 cycle 시점 정답 RUL | 100~249 | 1 col |
 
+> **파이프라인 vs 실험 파일 분리**: `full_ingest.sh` 및 Kafka 시뮬레이터는 **train 파일만** 사용 (run-to-failure 궤적 전체가 있어야 `rul_label = max_cycle − cycle` 계산 가능). `test_FD00x.txt`·`RUL_FD00x.txt` 는 `experiments/lstm_baseline.py` 에서 hold-out 평가용으로 별도 소비함.
+
 데이터는 [NASA Prognostics CoE Data Repository](https://www.nasa.gov/intelligent-systems-division/discovery-and-systems-health/pcoe/pcoe-data-set-repository/) 의 *Turbofan Engine Degradation Simulation Data Set* 에서 받아 `data/raw/` 에 풀어 넣는다 (`train_FD001.txt` ~ `RUL_FD004.txt` 12개 파일). `data/raw/` 는 [.gitignore](.gitignore) 대상.
 
 26 컬럼 = `unit_id, cycle, op_setting_1~3, sensor_1~21`. 1 row = 1 비행 cycle. 4개 dataset(FD001~FD004) 은 운영 조건 / fault mode 조합으로 난이도 차이.
@@ -48,6 +50,7 @@ event_ts = base_date  +  unit_jitter × unit_id  +  interval × (cycle − 1)
 | `--unit-jitter` | unit 별 출발 시점 분산 | `1h` |
 | `--cycle-interval` / `--speedup` | **발행 페이싱** (sleep만, event_ts 와 무관) | `60s / 600` |
 | `--max-units` | dataset 당 unit 제한 (스모크) | (전체) |
+| `--dry-run` | Kafka 미발행, 파싱·event_ts 합성만 검증 | off |
 
 **왜 분리했나** — `event_ts` 는 **데이터 시간** (시뮬 도메인), `ingest_ts` / 발행 페이싱은 **메타 시간** (실시간 적재). Iceberg time-travel 의 두 시간 축 (`AS OF snapshot` vs `WHERE event_ts BETWEEN`) 을 모두 시연 가능.
 
@@ -98,7 +101,18 @@ event_ts = base_date  +  unit_jitter × unit_id  +  interval × (cycle − 1)
 ```
 
 - **환경 선택**: 로컬 Docker (Spark + MinIO + **Iceberg REST Catalog** + Trino + Kafka + Airflow + Superset) — 상세는 [infra/README.md](infra/README.md).
-- **빠른 시작**: `docker compose -f infra/docker-compose.yml up -d && ./code/pipelines/full_ingest.sh` — DDL → 토픽 → Bronze streaming → Producer(FD001~FD004, **base_date=2025-08-01, 1 cycle = 1h**) → Silver → Gold(RUL+KPI). 단계별 동작은 [code/pipelines/README.md](code/pipelines/README.md#한-번에--full_ingestsh). 시뮬레이션 모델은 [§0-2](#0-2-시뮬레이션--cmaps_to_kafkapy-time-travel-simulation).
+- **빠른 시작** (선행 3단계 필수):
+  ```bash
+  # 1) NASA C-MAPSS 데이터 배치 — train_FD001.txt ~ RUL_FD004.txt 12개를 data/raw/ 에
+  # 2) 커스텀 이미지 빌드 (최초 1회)
+  docker compose -f infra/docker-compose.yml build
+  # 3) 자격증명 파일 준비 (기본값으로도 동작)
+  cp infra/.env.example infra/.env
+  # 4) 전체 파이프라인 실행
+  docker compose -f infra/docker-compose.yml up -d
+  ./code/pipelines/full_ingest.sh
+  ```
+  DDL → 토픽 → Bronze streaming → Producer(FD001~FD004, **base_date=2025-08-01, 1 cycle = 1h**) → Silver → Gold(RUL+KPI). 단계별 동작은 [code/pipelines/README.md](code/pipelines/README.md#한-번에--full_ingestsh). 시뮬레이션 모델은 [§0-2](#0-2-시뮬레이션--cmaps_to_kafkapy-time-travel-simulation).
 - **AWS 매핑**: MinIO ↔ S3, Iceberg REST ↔ Glue Iceberg REST/Tabular, Trino ↔ Athena, Spark ↔ EMR/EKS, Kafka ↔ MSK.
 - **카탈로그 설계 결정**: Hive Metastore 대신 REST Catalog 채택 — arm64 네이티브, 단일 컨테이너, Spark·Trino 동일 인터페이스. 자세한 근거는 [infra/README.md](infra/README.md).
 
@@ -112,20 +126,32 @@ event_ts = base_date  +  unit_jitter × unit_id  +  interval × (cycle − 1)
 - **시간 컬럼 분리**:
   - `event_ts` — 시뮬레이션상의 비행 발생 시각 (producer 가 `base_date + unit_jitter × unit_id + interval × (cycle−1)` 로 합성)
   - `ingest_ts` — Bronze 적재 시각 (Spark `current_timestamp()`)
-- **파티션**: `dataset_id, days(ingest_ts)` — 운영 감사 추적 (실시간 적재 흐름)
+- **파티션**: `dataset_id, days(ingest_ts)` — Silver는 `event_ts`(비행 발생 시각) 기준이지만, Bronze는 "언제 적재됐는가"(감사·장애 추적)가 목적이므로 `ingest_ts` 사용. 실시간 적재 흐름 추적에 최적.
 - **목적**: 원본 보존 → 백필·재처리·감사 가능.
 
 ### 3-2. Silver (processed)
 - **테이블**: `phm.silver.engine_health`
-- **변환**: 결측·이상치 제거, 정규화, 운영조건 클러스터링(FD002/004의 6 condition), Health Index 계산, rolling window 피처(평균/표준편차/추세).
-- **파티션**: `dataset_id, days(event_ts)` — **시계열 쿼리 가속** (drift, KPI 추이). op_condition_cluster 는 데이터 컬럼.
-- **MERGE INTO**로 멱등 백필 (`dataset_id, unit_id, cycle` 키).
+- **변환**:
+  1. 분산 0인 무정보 센서(1,5,6,10,16,18,19) 제외 → 잔여 14개(`s2,s3,s4,s7~s9,s11~s15,s17,s20,s21`) cluster별 z-score 정규화
+  2. `op_setting_1~3` 기반 KMeans(k=6, `seed=42`) → `op_condition_cluster` (FD002/004 6 운영조건 대응)
+  3. 5-cycle rolling window → `s_avg_w5`, `s_std_w5`, `s_trend_w5`
+  4. Health Index = `1 − min(|s_avg_w5|, 3) / 3` (0=열화, 1=정상; cluster 평균 대비 편차 기반)
+  5. `rul_label = max(cycle) − cycle` (train 가정: 최종 cycle = 고장 시점)
+- **파티션**: `dataset_id, days(event_ts)` — **시계열 쿼리 가속** (drift, KPI 추이). op_condition_cluster는 데이터 컬럼 (partition으로 두면 6 × days 수만큼 파티션 폭증).
+- **MERGE INTO**로 멱등 백필 (`dataset_id, unit_id, cycle` 키) — `WHEN MATCHED UPDATE + WHEN NOT MATCHED INSERT`.
+- **재현성 조건**: KMeans `seed=42` + 센터 오름차순 재정렬(`stable_cluster_ids`)로 매 실행 cluster 번호를 안정화. 이 조건이 충족될 때만 동일 입력 → 동일 Silver 행 보장.
 
 ### 3-3. Gold (summary)
-- **테이블**:
-  - `phm.gold.rul_prediction` — 엔진별 예측 RUL + 신뢰구간 + `model_version`
-  - `phm.gold.fleet_kpi_daily` — fleet 위험도, 운영조건별 열화율
-  - `phm.gold.model_metrics` — 모델 버전별 MAE / PHM08 Score
+- **테이블 · 파티션 · MERGE 키**:
+
+  | 테이블 | 내용 | 파티션 | MERGE 키 |
+  |---|---|---|---|
+  | `phm.gold.rul_prediction` | 엔진별 RUL 예측 + 신뢰구간 + `risk_tier`. `rul_actual`은 train 데이터에서만 유효 (test 시점에는 NULL) | `(model_version, dataset_id, days(predict_ts))` | `(model_version, dataset_id, unit_id, cycle)` |
+  | `phm.gold.fleet_kpi_daily` | fleet 위험도·운영조건별 열화율 일배치 | `(months(kpi_date), dataset_id)` | `(kpi_date, dataset_id, op_condition_cluster)` |
+  | `phm.gold.model_metrics` | 모델 버전별 MAE / RMSE / PHM08 Score | `(model_version)` | `(model_version, dataset_id, eval_window_end)` |
+
+- **모델**: 운영 Gold 파이프라인은 Spark MLlib `GBTRegressor` (단일 컨테이너에서 동작하는 v0 베이스라인). 학술 비교용 LSTM/CNN은 `experiments/lstm_baseline.py` 별도 실행.
+- **멱등**: 세 테이블 모두 MERGE INTO 적용 — 같은 키 재실행 시 UPDATE, 신규는 INSERT.
 - **활용**: 대시보드 직접 쿼리, 시계열 일관성을 위해 time-travel 사용.
 
 ---
@@ -134,11 +160,11 @@ event_ts = base_date  +  unit_jitter × unit_id  +  interval × (cycle − 1)
 
 1. **모델 재학습 시 학습 데이터 재현성** — `AS OF` time-travel로 "모델 v3 학습 시점 Silver" 그대로 복원.
 2. **3개월 백필 멱등성** — HI 산출 로직 변경 시 MERGE INTO 로 안전 재처리, snapshot 롤백 가능.
-3. **스키마 진화** — 신규 센서 추가 / 단위 변경에 ALTER TABLE만으로 대응(Parquet+Glue는 호환성 직접 관리).
-4. **파일 관리 자동화** — 1Hz 스트리밍이 만드는 작은 파일 폭증을 `rewrite_data_files`로 정리.
+3. **스키마 진화** — 신규 센서 추가 / 단위 변경에 ALTER TABLE만으로 대응(비-Iceberg Parquet+Hive는 호환성 직접 관리).
+4. **파일 관리 자동화** — 고속 마이크로배치 스트리밍(default speedup=600, ~0.1s/cycle)이 만드는 작은 파일 폭증을 `rewrite_data_files`로 정리.
 5. **OCC** — 컴팩션과 streaming MERGE가 같은 파티션을 건드릴 때 충돌 감지·재시도.
 
-> 단순 Parquet+Glue로는 (1)(2)(5)가 사실상 불가능. 이것이 PHM 운영의 핵심 가치.
+> 비-Iceberg Parquet+Hive Metastore로는 (1)(2)(5)가 사실상 불가능. 이것이 PHM 운영의 핵심 가치.
 
 ---
 
@@ -148,12 +174,12 @@ event_ts = base_date  +  unit_jitter × unit_id  +  interval × (cycle − 1)
 
 1. 엔진별 마지막 cycle 도착 시각 (센서 dropout 감지)
 2. `dataset_id × condition` 별 일자 행 수 추이
-3. 작은 파일(<128MB) 비율 (Iceberg `files` 메타)
+3. 작은 파일(<128MB) 비율 (Bronze·Silver·Gold 3개 테이블, Iceberg `$files` 메타)
 4. snapshot 증가율 (`$snapshots` 메타테이블)
 5. RUL 예측 MAE drift (Gold)
-6. Silver MERGE 충돌·재시도 카운트
+6. Silver MERGE commit 패턴 (replace 비율·추가/삭제 행수; OCC 실제 충돌은 Spark log에서 확인)
 7. 운영조건 클러스터 분포 변화 (data drift)
-8. `model_version` 별 예측 일관성 (time-travel diff)
+8. `model_version` 별 예측 일관성 (동일 테이블 내 버전 간 self JOIN — time-travel 아님)
 
 ---
 
@@ -180,8 +206,16 @@ event_ts = base_date  +  unit_jitter × unit_id  +  interval × (cycle − 1)
 
 ## 8. 장애·운영 시나리오
 
-1. **Streaming OOM**: checkpointLocation 복구 + `(source_file, line_no)` Bronze 멱등키.
-2. **3개월 백필**: producer 를 `--base-date $(date -d '90 days ago' +%F) --interval 1d` 로 재실행 → Silver MERGE → Gold 재집계. 같은 자연키(dataset/unit/cycle)면 UPDATE, event_ts 만 바뀜. expire 정책이 학습 윈도우(예: 90일)를 침범하지 않도록 보호.
+1. **Streaming OOM**: `full_ingest.sh`가 DDL 재적용 직후 Bronze checkpoint를 자동 삭제(step 3.5)하므로 스크립트 재실행으로 복구 가능. 수동 복구 시 `data/_checkpoints/bronze_engine_sensor_raw/` 삭제 후 재기동. Bronze 멱등키 `(source_file, line_no)` 덕분에 중복 적재 없음.
+2. **3개월 백필**: producer를 아래 커맨드로 재실행 → Silver MERGE → Gold 재집계. 같은 자연키(dataset/unit/cycle)면 UPDATE, event_ts 만 바뀜. expire 정책이 학습 윈도우(예: 90일)를 침범하지 않도록 보호.
+   ```bash
+   # Linux/WSL
+   --base-date $(date -d '90 days ago' +%F) --interval 1d
+   # macOS
+   --base-date $(date -v-90d +%F) --interval 1d
+   # 크로스 플랫폼
+   --base-date $(python3 -c "from datetime import date, timedelta; print(date.today()-timedelta(90))") --interval 1d
+   ```
 3. **컴팩션 vs MERGE 충돌**: OCC 재시도 + `partial-progress.enabled=true`, 컴팩션은 streaming 저부하 시간대(03~05시)로 분리.
 4. **재시뮬레이션 함정**: 다른 `--base-date` 로 재시뮬하면 자연키 동일 → MERGE 가 UPDATE 로 event_ts 만 덮어씀. 시계열 데이터를 보존하려면 시뮬 전 snapshot 태그 (`ALTER TABLE ... CREATE TAG`) 또는 `down -v` 로 전체 초기화.
 
@@ -189,10 +223,18 @@ event_ts = base_date  +  unit_jitter × unit_id  +  interval × (cycle − 1)
 
 ## 9. 멱등성 / 재처리 가능성 설계
 
-- **Bronze**: `(source_file, line_no)` 유니크 → 재적재 안전.
-- **Silver**: `MERGE INTO ... ON (dataset_id, unit_id, cycle)` — 같은 입력 N회 적용해도 동일 결과.
-- **Gold**: `(model_version, dataset_id, unit_id, cycle)` 키, `predict_ts` + `silver_snapshot_id` 기록으로 time-travel 재현.
-- **백필 절차**: ① Silver snapshot 태그 → ② 백필 실행 → ③ 실패 시 `ROLLBACK TO TAG`.
+- **Bronze**: `(source_file, line_no)` 유니크 → `WHEN NOT MATCHED THEN INSERT *` 만 실행 (기존 행 수정 없음).
+- **Silver**: `MERGE INTO ... ON (dataset_id, unit_id, cycle)` — matched UPDATE + not matched INSERT. KMeans `seed=42` 조건 하에 동일 입력 N회 → 동일 결과.
+- **Gold**: `(model_version, dataset_id, unit_id, cycle)` 키 — matched UPDATE + not matched INSERT. `predict_ts` + `silver_snapshot_id` 기록으로 time-travel 재현.
+- **백필 절차**:
+  ```sql
+  -- ① 태그 생성
+  ALTER TABLE phm.silver.engine_health CREATE TAG snap_before_backfill;
+  -- ② 백필 실행 (silver_transform.py)
+  -- ③ 실패 시 태그에서 snapshot_id 조회 후 롤백
+  SELECT snapshot_id FROM phm.silver.engine_health.refs WHERE name = 'snap_before_backfill';
+  CALL phm.system.rollback_to_snapshot(table => 'silver.engine_health', snapshot_id => <위 snapshot_id>);
+  ```
 
 ---
 
@@ -220,8 +262,8 @@ final_project/
 │   ├── health-queries/        # 운영 헬스 쿼리 8개
 │   └── maintenance/           # Iceberg 유지보수 (compaction/expire/orphan)
 ├── orchestration/             # Airflow DAG (적재/컴팩션/expire/orphan/예측)
-├── dashboard/                 # Superset 정의 + 스크린샷
-├── experiments/               # RUL baseline 모델 노트북 (LSTM/CNN)
+├── dashboard/                 # Superset export zip (비즈니스·운영 탭, 스크린샷 미첨부)
+├── experiments/               # RUL baseline 학습 스크립트 (lstm_baseline.py)
 ├── paper/                     # PHM Korea 논문 초안
 └── data/raw/                  # C-MAPSS 원본 (gitignore 대상)
 ```
