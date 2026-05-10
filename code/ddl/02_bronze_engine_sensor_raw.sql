@@ -3,7 +3,13 @@
 --
 -- 입력: Kafka 토픽 phm.engine.sensor (1 cycle = 1 메시지)
 -- 보존: 무기한 (감사·재처리 가능성)
--- 멱등키: (source_file, line_no) — 동일 라인 재적재해도 안전
+-- 쓰기 정책: append-only (writeTo(...).append()).
+--   ─ MERGE INTO 미사용 → batch 마다 read 비용 0, 트래픽 무관 일정 비용.
+--   ─ Spark Streaming foreachBatch at-least-once 로 발생 가능한 dup 은
+--     Silver 진입의 dedup_bronze() 가 (source_file, line_no) 단위 row_number=1
+--     로 흡수 (first-write-wins).
+--   ─ 결과: Bronze 행수 ≥ Silver 행수 가 정상 (dup 발생 시 strict >).
+--   ─ 작은 파일/snapshot 누적은 maintenance/ 가 흡수.
 -- ─────────────────────────────────────────────────────────────
 DROP TABLE IF EXISTS phm.bronze.engine_sensor_raw;
 

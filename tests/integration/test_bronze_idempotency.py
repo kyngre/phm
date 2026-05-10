@@ -1,11 +1,15 @@
-"""Iceberg 통합 테스트 — Bronze MERGE 멱등성.
+"""Iceberg 통합 테스트 — Bronze append-only 시맨틱.
 
-검증 시나리오 (README §9 — `(source_file, line_no)` 멱등키):
-  A. 같은 배치 두 번 적재 → 행 수 불변, 새 snapshot 만 추가
-  B. 동일 자연키지만 값이 다른 행 적재 → INSERT 안 됨 (`WHEN NOT MATCHED THEN INSERT *`)
-     ※ Bronze 의 의도: 원본 보존 — 첫 라인이 정답 (값 변경은 Silver 가 함)
-  C. 신규 line_no 가 섞인 배치 → 신규 행만 추가
-  D. 빈 배치 → no-op (커밋도 없음)
+Bronze 정책 (B 프레이밍 — 실시간 운영 추론):
+  - foreachBatch 마다 writeTo(...).append() — 읽기 비용 0
+  - 멱등성은 Silver 진입의 dedup_bronze() 가 흡수 → test_silver_incremental.py
+  - Bronze 자체는 *시스템 audit log* (raw, dup 가능)
+
+이 파일은 *Bronze 단의 행동* 만 검증:
+  A. 같은 batch 두 번 → 두 행 (append-only 약속)
+  B. 다른 source_file + 같은 line_no → 둘 다 (별개 키)
+  C. 빈 배치 → no-op (snapshot 생성 안 함)
+  D. 매 batch 마다 새 snapshot 발생
 """
 from __future__ import annotations
 
@@ -15,9 +19,9 @@ import pytest
 
 pytest.importorskip("pyspark", reason="integration tests require pyspark")
 
-from pyspark.sql import functions as F
+from pyspark.sql import functions as F  # noqa: E402
 
-from bronze_ingest import upsert_batch
+from bronze_ingest import append_batch  # noqa: E402
 
 pytestmark = pytest.mark.integration
 
@@ -63,7 +67,7 @@ def _row(line_no: int, unit: int = 1, cycle: int = 1, sensor_1: float = 100.0,
 
 @pytest.fixture
 def bronze_table(iceberg_spark, monkeypatch):
-    # upsert_batch 가 하드코딩된 phm.bronze 대신 test.bronze 를 가리키도록 패치
+    # append_batch 가 하드코딩된 phm.bronze 대신 test.bronze 를 가리키도록 패치
     import bronze_ingest
     monkeypatch.setattr(bronze_ingest, "TARGET_TABLE", "test.bronze.engine_sensor_raw")
     _create_bronze_table(iceberg_spark)
@@ -71,67 +75,69 @@ def bronze_table(iceberg_spark, monkeypatch):
     iceberg_spark.sql("DROP TABLE IF EXISTS test.bronze.engine_sensor_raw")
 
 
-class TestBronzeIdempotency:
-    def test_same_batch_twice_no_duplicates(self, iceberg_spark, bronze_table):
+class TestBronzeAppend:
+    """Bronze 는 append-only — 멱등성 보장은 Silver 가 한다."""
+
+    def test_same_batch_twice_creates_duplicates(self, iceberg_spark, bronze_table):
+        """같은 (source_file, line_no) 가 두 번 적재되면 두 행이 남는다.
+        이전 MERGE 시맨틱과 *의도적으로 다른* 동작 — 시스템 멱등성은 Silver 가 흡수.
+        """
         batch = iceberg_spark.createDataFrame([_row(i) for i in range(1, 11)])
-        upsert_batch(batch, batch_id=0)
-        first = iceberg_spark.table(bronze_table).count()
-        assert first == 10
+        append_batch(batch, batch_id=0)
+        assert iceberg_spark.table(bronze_table).count() == 10
 
-        upsert_batch(batch, batch_id=1)
-        second = iceberg_spark.table(bronze_table).count()
-        assert second == 10, "같은 (source_file, line_no) 재적재 — 행 수 변하면 안 됨"
+        append_batch(batch, batch_id=1)
+        assert iceberg_spark.table(bronze_table).count() == 20, (
+            "Bronze append-only 인데 두 번째 batch 가 dedup 됨 — 정책 깨짐"
+        )
 
-    def test_value_change_on_same_key_does_not_overwrite(self, iceberg_spark, bronze_table):
-        """Bronze 정책: WHEN NOT MATCHED THEN INSERT *  (UPDATE 없음)
-        같은 line_no 로 다른 sensor_1 값을 보내도 첫 적재 값이 유지돼야 함."""
-        original = iceberg_spark.createDataFrame([_row(line_no=1, sensor_1=100.0)])
-        upsert_batch(original, 0)
-
-        mutated = iceberg_spark.createDataFrame([_row(line_no=1, sensor_1=999.0)])
-        upsert_batch(mutated, 1)
-
-        rows = iceberg_spark.table(bronze_table).collect()
-        assert len(rows) == 1
-        assert rows[0]["sensor_1"] == 100.0, \
-            "Bronze 는 INSERT-only — 같은 키의 값이 덮어써지면 원본 보존 약속 깨짐"
-
-    def test_overlapping_batch_inserts_only_new(self, iceberg_spark, bronze_table):
-        first = iceberg_spark.createDataFrame([_row(i) for i in range(1, 6)])
-        upsert_batch(first, 0)
-        assert iceberg_spark.table(bronze_table).count() == 5
-
-        # 3,4,5 중복 + 6,7,8 신규
-        overlap = iceberg_spark.createDataFrame([_row(i) for i in range(3, 9)])
-        upsert_batch(overlap, 1)
-        assert iceberg_spark.table(bronze_table).count() == 8
+        # (source_file, line_no) 단위 dup 카운트 확인
+        dups = (
+            iceberg_spark.table(bronze_table)
+            .groupBy("source_file", "line_no").count()
+            .where(F.col("count") > 1)
+            .count()
+        )
+        assert dups == 10, f"기대: 10개 키 모두 dup. 실제 dup 키: {dups}"
 
     def test_different_source_file_same_line_no_both_inserted(
         self, iceberg_spark, bronze_table,
     ):
-        """멱등키는 (source_file, line_no) — source_file 이 다르면 별개 row."""
+        """다른 source_file + 같은 line_no — 별개 row (키 자체가 다름)."""
         a = iceberg_spark.createDataFrame([_row(line_no=1, source_file="train_FD001.txt")])
         b = iceberg_spark.createDataFrame([_row(line_no=1, source_file="train_FD002.txt")])
-        upsert_batch(a, 0)
-        upsert_batch(b, 1)
+        append_batch(a, 0)
+        append_batch(b, 1)
         assert iceberg_spark.table(bronze_table).count() == 2
 
     def test_empty_batch_no_op(self, iceberg_spark, bronze_table):
+        """빈 배치는 snapshot 도 만들지 않음 (rewrite/expire 비용 절감)."""
         empty = iceberg_spark.createDataFrame(
             [_row(1)]
         ).where(F.lit(False))  # 스키마는 유지, 행은 0
-        upsert_batch(empty, 0)
+        snaps_before = iceberg_spark.sql(
+            f"SELECT COUNT(*) AS n FROM {bronze_table}.snapshots"
+        ).collect()[0]["n"]
+
+        append_batch(empty, 0)
+
         assert iceberg_spark.table(bronze_table).count() == 0
+        snaps_after = iceberg_spark.sql(
+            f"SELECT COUNT(*) AS n FROM {bronze_table}.snapshots"
+        ).collect()[0]["n"]
+        assert snaps_after == snaps_before, "빈 배치인데 snapshot 이 늘었음"
 
-    def test_three_runs_create_three_snapshots(self, iceberg_spark, bronze_table):
-        """Iceberg snapshot 누적 — 멱등 재실행이라도 snapshot 자체는 늘어남.
+    def test_each_batch_creates_new_snapshot(self, iceberg_spark, bronze_table):
+        """매 batch = 1 snapshot. incremental scan watermark 의 입력이 됨.
 
-        README §5 #4 (snapshot 증가율) 의 "재실행 → snapshot 폭증" 시나리오 근거.
+        README §5 #4 의 "snapshot 증가율" 모니터링이 의미 있는 이유 + Silver
+        incremental 의 start-snapshot-id 가 매 batch 단위로 전진할 수 있는 근거.
         """
-        batch = iceberg_spark.createDataFrame([_row(1)])
         for i in range(3):
-            upsert_batch(batch, i)
+            batch = iceberg_spark.createDataFrame([_row(line_no=10 + i)])
+            append_batch(batch, i)
         snaps = iceberg_spark.sql(
             f"SELECT COUNT(*) AS n FROM {bronze_table}.snapshots"
         ).collect()
         assert snaps[0]["n"] >= 3
+        assert iceberg_spark.table(bronze_table).count() == 3

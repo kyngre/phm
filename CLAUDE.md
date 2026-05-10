@@ -41,7 +41,7 @@ data/_checkpoints/      Spark streaming checkpoint (호스트 bind mount, down -
 2. **`pgrep -f bronze_ingest.py` 자기 매칭** — bash 스크립트의 cmdline 에 패턴 문자열이 들어 있으면 pgrep 이 부모 bash 를 매칭. 회피책: pgrep 을 컨테이너 내부가 아니라 **호스트에서 `docker exec phm-spark pgrep ...`** 으로 호출.
 3. **AWS SDK v1+v2 공존** — Iceberg S3FileIO 는 v2, hadoop-aws 3.3.4 의 S3AFileSystem 은 v1. 둘 다 jar 에 있음 (`aws-java-sdk-bundle-1.12.262.jar` + `aws-sdk-bundle-2.24.6.jar`). 패키지 namespace 가 달라 충돌 없음. `remove_orphan_files` 절차가 v1 의 S3AFileSystem 을 요구 — 빠지면 `No FileSystem for scheme "s3"` 에러.
 4. **Airflow SequentialExecutor + SQLite** — 동시성 1. Long-running spark-submit DAG 가 다른 DAG 를 큐잉. `LocalExecutor` 로 바꾸면 SQLite 와 충돌 (Postgres 필수).
-5. **Iceberg REST 500 (대량 commit)** — 카탈로그 부하. 완화: producer 분할 발행, `bronze_ingest` trigger 간격 늘리기, 또는 `phm-iceberg-rest` 재기동. 멱등키 덕에 재시도 안전.
+5. **Iceberg REST 500 (대량 commit)** — 카탈로그 부하. 완화: producer 분할 발행, `bronze_ingest` trigger 간격 늘리기, 또는 `phm-iceberg-rest` 재기동. Bronze append-only + Silver dedup 정책 덕에 재시도가 dup 을 만들어도 silver 단에서 흡수 → 재시도 안전.
 6. **`docker compose down -v` 가 Superset/Airflow metadata DB wipe** — 차트·DAG state 사라짐. DAG 정의는 파일이라 OK, Superset 차트는 export zip 으로 보관 권장.
 7. **Spark 컨테이너 recreate 시 pip 사라짐** — numpy/kafka-python 은 Dockerfile 에 사전 설치됨. torch (LSTM 학습용) 는 무거워 Dockerfile 에 없고 첫 실행 시 `pip install` 필요.
 8. **`spark compose up -d <subset>` 후 minio-init 누락** — minio volume 이 wipe 됐을 때 `minio-init` 도 같이 띄워야 warehouse 버킷 생성.
@@ -51,7 +51,7 @@ data/_checkpoints/      Spark streaming checkpoint (호스트 bind mount, down -
 - **답변 언어**: 한국어. 코드 주석도 한국어 위주.
 - **응답 톤**: 짧고 구체. 결과 표 우선. 필요할 때만 설명.
 - **CLI 우선**: GUI 작업은 사용자 몫 (Superset 차트 빌드, dashboard export 등).
-- **멱등성 원칙**: 모든 적재 단계가 MERGE INTO 키로 멱등. 재실행 자유.
+- **멱등성 원칙**: Bronze 는 append-only (write 비용 일정), Silver 진입에서 `(source_file, line_no)` 단위로 dedup. Silver/Gold 는 MERGE INTO 키로 멱등. 재실행 자유.
 - **시간 컬럼 분리**: `event_ts` (시뮬 도메인 시각) ↔ `ingest_ts` (실시간 적재) ↔ `predict_ts` (예측 실행 시각). 절대 혼용 금지.
 - **시뮬 default 인자**: `--base-date 2025-08-01 --interval 1h --unit-jitter 1h` (root README §0-2 참조).
 
@@ -75,6 +75,8 @@ data/_checkpoints/      Spark streaming checkpoint (호스트 bind mount, down -
 - **Time-Travel Simulation**: producer 가 event_ts 를 합성. `event_ts ≠ ingest_ts` 분리로 Iceberg time-travel 의 두 축(`AS OF snapshot` vs `WHERE event_ts BETWEEN`) 모두 시연.
 - **Airflow 패턴**: BashOperator + `docker exec phm-spark|phm-trino` (SparkSubmitOperator/connection 불필요). docker.sock 마운트 + Airflow 컨테이너 내 docker CLI.
 - **모델 멱등키 정책**: `(model_version, dataset_id, unit_id, cycle)` — 같은 모델 재실행 시 UPDATE, 새 모델은 새 행. version 으로 모델 비교 자동화.
+- **Bronze append-only + Silver dedup**: Bronze 는 `MERGE INTO` 미사용 — `writeTo(...).append()` 로 batch 마다 read 비용 0. Spark Streaming at-least-once 의 dup 은 Silver 진입의 `dedup_bronze()` (`row_number()=1` over `(source_file, line_no)`, first-write-wins) 가 흡수. 운영 시스템에서 트래픽 증가 시 Bronze write 비용이 데이터 누적과 무관해지는 패턴 시연.
+- **Silver 증분 처리**: 매시간 `silver_merge_dag` 가 `--mode incremental` 호출. `phm.silver.pipeline_state.last_snapshot_id` 이후 bronze 변경분만 Iceberg `start-snapshot-id` 옵션으로 스캔, 영향 `(dataset, unit)` 의 모든 cycle 을 재변환 (rolling window + rul_label 정확성). KMeans/cluster 통계는 주 1회 `silver_fit_stats_dag` 가 `phm.silver.feat_stats` 에 갱신.
 
 ## 작업 시 우선 확인할 것
 

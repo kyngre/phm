@@ -5,7 +5,8 @@ Airflow standalone (SQLite + SequentialExecutor) on `phm-airflow`. UI: http://lo
 | DAG | 스케줄 (UTC) | 설명 |
 |---|---|---|
 | `ingest_streaming_dag` | `*/5 * * * *` | Bronze streaming process 헬스체크·재시작 |
-| `silver_merge_dag` | `0 * * * *` | Bronze → Silver MERGE INTO |
+| `silver_merge_dag` | `0 * * * *` | Bronze → Silver 증분 MERGE (watermark 이후 변경분만) |
+| `silver_fit_stats_dag` | `0 6 * * 1` | KMeans + cluster별 sensor mean/std 재학습 (주 1회) |
 | `gold_rul_predict_dag` | `15 * * * *` | Silver → RUL 예측 (gbt-v0) |
 | `gold_kpi_dag` | `30 0 * * *` | fleet KPI 일배치 |
 | `iceberg_compaction_dag` | `0 3 * * *` | rewrite_data_files + rewrite_manifests |

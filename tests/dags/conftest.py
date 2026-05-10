@@ -26,7 +26,8 @@ sys.path.insert(0, DAGS_FOLDER)
 # 변경 시 README 와 동기화 필요 — 테스트가 그 동기화를 강제한다.
 EXPECTED_DAGS = {
     "ingest_streaming_dag":      {"schedule": "*/5 * * * *",  "tags": ["bronze", "streaming"]},
-    "silver_merge_dag":          {"schedule": "0 * * * *",    "tags": ["silver"]},
+    "silver_merge_dag":           {"schedule": "0 * * * *",    "tags": ["silver"]},
+    "silver_fit_stats_dag":       {"schedule": "0 6 * * 1",    "tags": ["silver", "weekly"]},
     "gold_rul_predict_dag":      {"schedule": "15 * * * *",   "tags": ["gold", "ml"]},
     "gold_kpi_dag":              {"schedule": "30 0 * * *",   "tags": ["gold", "kpi"]},
     "iceberg_compaction_dag":    {"schedule": "0 3 * * *",    "tags": ["maintenance", "iceberg"]},

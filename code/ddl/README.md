@@ -5,6 +5,8 @@
 | `01_namespaces.sql` | `phm.bronze` / `phm.silver` / `phm.gold` 네임스페이스 생성 |
 | `02_bronze_engine_sensor_raw.sql` | 원본 센서 스트림 |
 | `03_silver_engine_health.sql` | 정제 + HI + 운영조건 클러스터 |
+| `03b_silver_feat_stats.sql` | KMeans centroids + 클러스터별 센서 mean/std (증분 변환 입력) |
+| `03c_silver_pipeline_state.sql` | 증분 변환 watermark (마지막 처리 bronze snapshot) |
 | `04_gold_rul_prediction.sql` | 엔진별 RUL 예측 |
 | `05_gold_fleet_kpi_daily.sql` | fleet 단위 KPI |
 | `06_gold_model_metrics.sql` | 모델 버전별 성능 지표 |

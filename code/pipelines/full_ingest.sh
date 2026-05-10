@@ -94,9 +94,9 @@ docker exec -i "$SPARK" /opt/spark/bin/spark-sql \
              COUNT(DISTINCT DATE(event_ts)) AS days_span
       FROM phm.bronze.engine_sensor_raw GROUP BY dataset_id ORDER BY dataset_id;"
 
-echo "▶ 8) Silver MERGE"
+echo "▶ 8) Silver — full mode (KMeans fit + 전량 변환 + feat_stats/pipeline_state 초기화)"
 docker exec -i "$SPARK" /opt/spark/bin/spark-submit --master 'local[*]' \
-  /workspace/code/pipelines/silver_transform.py
+  /workspace/code/pipelines/silver_transform.py --mode full
 
 echo "▶ 9) Gold RUL 예측 (gbt-v0)"
 docker exec -i "$SPARK" /opt/spark/bin/spark-submit --master 'local[*]' \

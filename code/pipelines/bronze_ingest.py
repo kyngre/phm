@@ -1,9 +1,16 @@
 """
 Spark Structured Streaming: Kafka → Bronze Iceberg (phm.bronze.engine_sensor_raw).
 
-- 멱등키: (source_file, line_no) — Kafka 재처리 시 중복 차단을 위해 MERGE INTO 사용.
+정책 — Bronze 는 append-only:
+  - foreachBatch 마다 writeTo(...).append() 로 *읽지 않고 쓰기만 한다*.
+  - MERGE INTO 를 쓰지 않음으로써 batch 마다의 read amplification 을 0 으로 만든다
+    (운영 시스템 패턴: 트래픽 증가 시 Bronze write 비용이 데이터 누적과 무관).
+  - 멱등성은 Silver 진입의 dedup_bronze() 에서 (source_file, line_no) 단위로 보장.
+    Spark Structured Streaming foreachBatch 의 at-least-once 로 발생하는 dup 을 흡수.
+
 - event_ts: 메시지에 없으면 ingest_ts 와 동일 (실 운영에서는 producer가 채움).
 - partition: dataset_id, days(ingest_ts).
+- 작은 파일 누적: maintenance/01_rewrite_data_files.sql (일배치) 가 흡수.
 
 실행:
   docker exec -it phm-spark /opt/spark/bin/spark-submit \
@@ -58,21 +65,15 @@ def build_spark() -> SparkSession:
     )
 
 
-def upsert_batch(batch_df, batch_id: int):
+def append_batch(batch_df, batch_id: int):
+    """배치를 Bronze 에 append. 읽기 비용 0.
+
+    중복 (source_file, line_no) 는 Silver 진입에서 dedup — 모듈 docstring 참조.
+    빈 배치는 빈 snapshot 생성 회피 위해 early return.
+    """
     if batch_df.rdd.isEmpty():
         return
-    batch_df.createOrReplaceTempView("_bronze_batch")
-    spark = batch_df.sparkSession
-    # (source_file, line_no) 멱등 — 중복 라인은 무시.
-    spark.sql(f"""
-        MERGE INTO {TARGET_TABLE} t
-        USING (
-            SELECT * FROM _bronze_batch
-        ) s
-        ON  t.source_file = s.source_file
-        AND t.line_no     = s.line_no
-        WHEN NOT MATCHED THEN INSERT *
-    """)
+    batch_df.writeTo(TARGET_TABLE).append()
 
 
 def main():
@@ -115,7 +116,7 @@ def main():
 
     query = (
         parsed.writeStream
-        .foreachBatch(upsert_batch)
+        .foreachBatch(append_batch)
         .option("checkpointLocation", CHECKPOINT)
         .trigger(processingTime=TRIGGER_INTERVAL)
         .start()

@@ -1,11 +1,13 @@
 """Spark 유닛 테스트 — silver_transform.py.
 
-Iceberg 없이 로컬 Spark 만으로 핵심 변환 4종을 검증:
+Iceberg 없이 로컬 Spark 만으로 핵심 변환을 검증:
   1) stable_cluster_ids: cluster id 가 op_setting_1 오름차순으로 재할당
   2) cluster_op_conditions: seed=42 + stable id → 같은 데이터 N회 → 동일 분포
   3) add_rolling_features: window=3 손계산값과 일치 (avg / stddev_samp / trend)
   4) add_health_index: 경계값 (z=0, |z|=3, |z|>3) 검증
-  5) add_rul_label: max(cycle) - cycle per (dataset_id, unit_id)
+  5) assign_cluster_from_centroids: fit 없이 centroids 만으로 cluster 부여 (incremental 정확성)
+  6) apply_zscore_from_stats: feat_stats join 정규화 == inline z-score (full↔incremental 동치)
+  7) add_rul_label: max(cycle) - cycle per (dataset_id, unit_id)
 """
 from __future__ import annotations
 
@@ -19,9 +21,13 @@ from pyspark.ml.linalg import Vectors
 from pyspark.sql import functions as F
 
 from silver_transform import (
+    KEEP_SENSORS,
     add_health_index,
     add_rolling_features,
     add_rul_label,
+    apply_zscore_from_stats,
+    apply_zscore_inline,
+    assign_cluster_from_centroids,
     cluster_op_conditions,
     stable_cluster_ids,
 )
@@ -220,7 +226,120 @@ class TestAddHealthIndex:
             assert 0.0 <= r["health_index"] <= 1.0
 
 
-# ──────────────── 5) add_rul_label ────────────────
+# ──────────────── 5) assign_cluster_from_centroids (incremental 모드용) ────────────────
+
+
+class TestAssignClusterFromCentroids:
+    """fit 없이 기존 centroids 만으로 cluster 부여. 증분 모드의 핵심 정확성 보장."""
+
+    def test_matches_kmeans_transform(self, spark):
+        """cluster_op_conditions(fit) 와 동일한 입력 + 동일 centroids → 동일 cluster id.
+
+        이게 깨지면 incremental 모드의 결과가 full 모드와 달라진다.
+        """
+        df = _make_bronze_df(spark, n_units=4, n_cycles=30)
+        fitted, sorted_centers = cluster_op_conditions(df, k=6, seed=42)
+        assigned = assign_cluster_from_centroids(df, sorted_centers)
+
+        a = sorted([(r["unit_id"], r["cycle"], r["op_condition_cluster"])
+                    for r in fitted.collect()])
+        b = sorted([(r["unit_id"], r["cycle"], r["op_condition_cluster"])
+                    for r in assigned.collect()])
+        assert a == b, "centroids 재사용 cluster 부여가 KMeans transform 과 다름"
+
+    def test_argmin_picks_nearest(self, spark):
+        """수동으로 만든 점이 가장 가까운 cluster 를 받는지."""
+        # cluster 0 center=(0,0,0), cluster 1=(10,0,0), cluster 2=(0,10,0)
+        sorted_centers = [(0.0, 0.0, 0.0), (10.0, 0.0, 0.0), (0.0, 10.0, 0.0)]
+        # (1,0,0) → cluster 0;  (9,0,0) → cluster 1;  (0,9,0) → cluster 2
+        rows = [
+            ("FD001", 1, 1, 1.0, 0.0, 0.0),
+            ("FD001", 1, 2, 9.0, 0.0, 0.0),
+            ("FD001", 1, 3, 0.0, 9.0, 0.0),
+        ]
+        df = spark.createDataFrame(
+            rows,
+            ["dataset_id", "unit_id", "cycle",
+             "op_setting_1", "op_setting_2", "op_setting_3"],
+        )
+        out = {r["cycle"]: r["op_condition_cluster"]
+               for r in assign_cluster_from_centroids(df, sorted_centers).collect()}
+        assert out == {1: 0, 2: 1, 3: 2}
+
+    def test_tie_picks_lowest_id(self, spark):
+        """동률 시 cluster_id 작은 쪽이 우선 — incremental 결정성 보장."""
+        # 두 centroid 가 (5,0,0) 에서 등거리: (0,0,0) 과 (10,0,0)
+        sorted_centers = [(0.0, 0.0, 0.0), (10.0, 0.0, 0.0)]
+        df = spark.createDataFrame(
+            [("FD001", 1, 1, 5.0, 0.0, 0.0)],
+            ["dataset_id", "unit_id", "cycle",
+             "op_setting_1", "op_setting_2", "op_setting_3"],
+        )
+        out = assign_cluster_from_centroids(df, sorted_centers).collect()
+        assert out[0]["op_condition_cluster"] == 0
+
+
+# ──────────────── 6) apply_zscore_from_stats (broadcast join 정규화) ────────────────
+
+
+class TestApplyZscoreFromStats:
+    """incremental 모드는 feat_stats 를 join 으로 적용. 결과가 inline z-score 와 일치해야 함."""
+
+    def _build_stats_df(self, spark, df_with_cluster):
+        """현재 배치에서 inline 통계를 계산해 feat_stats 같은 wide 형태로 만든다."""
+        from pyspark.sql import functions as F
+        agg = [F.count(F.lit(1)).alias("n_samples")]
+        for s in KEEP_SENSORS:
+            agg += [F.avg(f"sensor_{s}").alias(f"sensor_{s}_mean"),
+                    F.stddev_pop(f"sensor_{s}").alias(f"sensor_{s}_std")]
+        return (
+            df_with_cluster.groupBy("dataset_id", "op_condition_cluster")
+                           .agg(*agg)
+                           .withColumnRenamed("op_condition_cluster", "cluster_id")
+        )
+
+    def test_matches_inline_zscore(self, spark):
+        """feat_stats 적용 결과 == 현재 배치 inline 통계 적용 결과 (full ↔ incremental 동치성)."""
+        df = _make_bronze_df(spark, n_units=4, n_cycles=20)
+        clustered, _centers = cluster_op_conditions(df, k=6, seed=42)
+
+        # full 경로: 자기 자신의 통계로
+        inline = apply_zscore_inline(clustered)
+
+        # incremental 경로: 통계를 별도 df 로 만들어 broadcast join
+        stats = self._build_stats_df(spark, clustered)
+        from_stats = apply_zscore_from_stats(clustered, stats)
+
+        # 두 결과의 norm 컬럼들이 동일해야 함
+        norm_cols = [f"s{s}_norm" for s in KEEP_SENSORS]
+        a = inline.select("unit_id", "cycle", *norm_cols).orderBy("unit_id", "cycle").collect()
+        b = from_stats.select("unit_id", "cycle", *norm_cols).orderBy("unit_id", "cycle").collect()
+        assert len(a) == len(b)
+        for ra, rb in zip(a, b):
+            assert ra["unit_id"] == rb["unit_id"]
+            assert ra["cycle"] == rb["cycle"]
+            for col in norm_cols:
+                assert ra[col] == pytest.approx(rb[col], rel=1e-9, abs=1e-9), \
+                    f"({ra['unit_id']},{ra['cycle']}) {col}: inline={ra[col]} stats={rb[col]}"
+
+    def test_zero_std_falls_back_to_zero(self, spark):
+        """sensor_X_std=0 인 (cluster, dataset) 은 norm=0 — 분모 0 회피."""
+        from pyspark.sql import Row
+        # bronze 1행 (n_samples=1 → stddev_pop=0)
+        rows = [{
+            "dataset_id": "FD001", "unit_id": 1, "cycle": 1,
+            "op_setting_1": 0.0, "op_setting_2": 0.0, "op_setting_3": 0.0,
+            "op_condition_cluster": 0,
+            **{f"sensor_{s}": 100.0 for s in KEEP_SENSORS},
+        }]
+        df = spark.createDataFrame([Row(**r) for r in rows])
+        stats = self._build_stats_df(spark, df)
+        out = apply_zscore_from_stats(df, stats).collect()
+        for s in KEEP_SENSORS:
+            assert out[0][f"s{s}_norm"] == 0.0
+
+
+# ──────────────── 7) add_rul_label ────────────────
 
 
 class TestAddRulLabel:

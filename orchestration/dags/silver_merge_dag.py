@@ -1,7 +1,10 @@
-"""Bronze → Silver MERGE — 매시 정각.
+"""Bronze → Silver 증분 MERGE — 매시 정각.
 
-silver_transform.py 는 Bronze 전체를 읽어 KMeans/정규화/롤링/HI/RUL 라벨을 계산하고
-(dataset_id, unit_id, cycle) 기준 MERGE INTO. 멱등 → 재실행 안전.
+silver_transform.py --mode incremental 호출.
+phm.silver.pipeline_state.last_snapshot_id 이후 bronze 변경분만 처리하고,
+영향받은 (dataset, unit) 의 모든 cycle 을 다시 변환해 rolling/rul_label 정확성 유지.
+KMeans 통계는 silver_fit_stats_dag 가 주 1회 갱신.
+멱등키: (dataset_id, unit_id, cycle).
 """
 from __future__ import annotations
 
@@ -14,7 +17,7 @@ from _common import DEFAULT_ARGS, spark_submit
 
 with DAG(
     dag_id="silver_merge_dag",
-    description="Bronze→Silver MERGE INTO (KMeans·정규화·롤링·HI·RUL 라벨)",
+    description="Bronze→Silver 증분 MERGE (watermark 이후 변경분만)",
     default_args=DEFAULT_ARGS,
     start_date=datetime(2026, 1, 1),
     schedule="0 * * * *",
@@ -22,6 +25,9 @@ with DAG(
     tags=["silver"],
 ) as dag:
     BashOperator(
-        task_id="silver_transform",
-        bash_command=spark_submit("/workspace/code/pipelines/silver_transform.py"),
+        task_id="silver_incremental",
+        bash_command=spark_submit(
+            "/workspace/code/pipelines/silver_transform.py",
+            extra_args="--mode incremental",
+        ),
     )

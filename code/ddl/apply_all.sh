@@ -14,6 +14,8 @@ FILES=(
   "01_namespaces.sql"
   "02_bronze_engine_sensor_raw.sql"
   "03_silver_engine_health.sql"
+  "03b_silver_feat_stats.sql"
+  "03c_silver_pipeline_state.sql"
   "04_gold_rul_prediction.sql"
   "05_gold_fleet_kpi_daily.sql"
   "06_gold_model_metrics.sql"
