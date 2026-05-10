@@ -1,0 +1,171 @@
+@startuml phm_lakehouse_architecture
+title Apache Iceberg 기반 항공기 엔진 PHM 데이터 레이크하우스 아키텍처
+
+skinparam backgroundColor #FFFFFF
+skinparam shadowing false
+skinparam roundCorner 8
+skinparam defaultFontName "Helvetica"
+skinparam defaultFontSize 12
+skinparam ArrowColor #555555
+skinparam ArrowThickness 1.2
+
+skinparam component {
+  BackgroundColor #FAFAFA
+  BorderColor #888888
+}
+skinparam database {
+  BackgroundColor #FFF7E0
+  BorderColor #B07A1C
+}
+skinparam queue {
+  BackgroundColor #E8F1FB
+  BorderColor #2C6FB1
+}
+skinparam node {
+  BackgroundColor #F4F4F4
+  BorderColor #777777
+}
+skinparam package {
+  BackgroundColor transparent
+  BorderColor #BBBBBB
+  FontStyle bold
+}
+
+' =========================================================
+' 1) 데이터 소스 / 시뮬레이터
+' =========================================================
+package "데이터 소스" #FDF5E6 {
+  database "NASA C-MAPSS\ntrain_FD001~FD004.txt\n(26 cols × N cycles)" as CMAPSS
+  component "cmaps_to_kafka.py\n(event_ts 합성:\nbase_date + jitter·unit_id + Δ·(cycle−1))" as PRODUCER
+}
+
+' =========================================================
+' 2) 스트리밍 버스
+' =========================================================
+package "메시지 버스" #EAF3FB {
+  queue "Kafka topic\nengine.sensor.raw" as KAFKA
+}
+
+' =========================================================
+' 3) 처리 엔진 (Spark)
+' =========================================================
+package "처리 엔진 (Apache Spark)" #F0F7EE {
+  component "Bronze Streaming\nbronze_ingest.py\n(Structured Streaming, MERGE)" as SPARK_BRONZE
+  component "Silver Batch\nsilver_transform.py\n(KMeans k=6 seed=42,\nrolling·HI·rul_label, MERGE)" as SPARK_SILVER
+  component "Gold RUL Predict\ngold_rul_predict.py\n(MLlib GBTRegressor, MERGE)" as SPARK_RUL
+  component "Gold KPI Aggregate\ngold_kpi_aggregate.py\n(fleet 위험도·열화율, MERGE)" as SPARK_KPI
+}
+
+' =========================================================
+' 4) 레이크하우스 (Iceberg + REST Catalog + MinIO)
+' =========================================================
+package "데이터 레이크하우스" #FFF7E0 {
+  component "Iceberg REST Catalog" as REST
+  database "MinIO (S3 호환)\nwarehouse/" as MINIO
+
+  package "메달리온 3계층 (Apache Iceberg)" #FFFBEC {
+    database "Bronze\nphm.bronze.engine_sensor_raw\nPK (source_file, line_no)\npart: dataset_id, days(ingest_ts)" as BRONZE
+    database "Silver\nphm.silver.engine_health\nMERGE (dataset_id, unit_id, cycle)\npart: dataset_id, days(event_ts)" as SILVER
+    database "Gold\nrul_prediction · fleet_kpi_daily · model_metrics\nMERGE (model_version, ds, unit, cycle)" as GOLD
+  }
+}
+
+' =========================================================
+' 5) 오케스트레이션 (Airflow)
+' =========================================================
+package "오케스트레이션 (Airflow DAGs)" #F5EFFA {
+  component "ingest_streaming_dag" as DAG_INGEST
+  component "silver_merge_dag" as DAG_SILVER
+  component "gold_rul_predict_dag" as DAG_GRUL
+  component "gold_kpi_dag" as DAG_GKPI
+  component "iceberg_compaction_dag\n(rewrite_data_files, 03~05시)" as DAG_COMP
+  component "iceberg_expire_dag\nOLDER_THAN_DAYS = 100\n(학습 90d + 마진 10d)" as DAG_EXP
+  component "iceberg_orphan_cleanup_dag" as DAG_ORPH
+  component "health_check_dag\n(헬스 쿼리 8선)" as DAG_HEALTH
+}
+
+' =========================================================
+' 6) 쿼리 / 가시성
+' =========================================================
+package "쿼리 & 가시성" #FDECEC {
+  component "Trino (질의 엔진)" as TRINO
+  component "Superset 비즈니스 탭\n(RUL 분포·위험 Top10·정비 큐)" as SUPERSET_BIZ
+  component "Superset 운영 탭\n(신선도·작은파일·snapshot·드리프트)" as SUPERSET_OPS
+  component "헬스 쿼리 8선\ncode/health-queries/" as HEALTH_SQL
+}
+
+' =========================================================
+' 7) 학술 비교 (별도 실행)
+' =========================================================
+package "학술 비교 (offline)" #ECF5F1 {
+  component "experiments/lstm_baseline.py\n(LSTM/CNN, time-travel\nAS OF 학습 데이터 고정)" as LSTM
+}
+
+' =========================================================
+' 페르소나
+' =========================================================
+actor "P1 데이터 엔지니어\n(Daniel)" as P1
+actor "P2 PHM 연구원\n(Suji)" as P2
+actor "P3 정비 운영자\n(Jaehyun)" as P3
+
+' =========================================================
+' 데이터 흐름 (실선 = 데이터, 점선 = 제어/메타)
+' =========================================================
+CMAPSS --> PRODUCER : "txt 12 files\n(train·test·RUL)"
+PRODUCER --> KAFKA : "JSON event\n+ event_ts"
+KAFKA --> SPARK_BRONZE : "subscribe"
+SPARK_BRONZE --> BRONZE : "MERGE INTO\n(INSERT-only)"
+BRONZE --> SPARK_SILVER : "read"
+SPARK_SILVER --> SILVER : "MERGE INTO"
+SILVER --> SPARK_RUL : "features"
+SILVER --> SPARK_KPI : "aggregate"
+SPARK_RUL --> GOLD : "MERGE INTO\nrul_prediction"
+SPARK_KPI --> GOLD : "MERGE INTO\nfleet_kpi_daily"
+
+' Iceberg 메타·스토리지
+BRONZE -[#B07A1C,dashed]-> REST
+SILVER -[#B07A1C,dashed]-> REST
+GOLD  -[#B07A1C,dashed]-> REST
+REST  -[#B07A1C,dashed]-> MINIO : "table metadata\n(snapshots, manifests)"
+BRONZE -[#B07A1C,dashed]-> MINIO : "Parquet"
+SILVER -[#B07A1C,dashed]-> MINIO : "Parquet"
+GOLD   -[#B07A1C,dashed]-> MINIO : "Parquet"
+
+' Airflow 스케줄링 (점선)
+DAG_INGEST  -[#7A4FB0,dotted]-> SPARK_BRONZE
+DAG_SILVER  -[#7A4FB0,dotted]-> SPARK_SILVER
+DAG_GRUL    -[#7A4FB0,dotted]-> SPARK_RUL
+DAG_GKPI    -[#7A4FB0,dotted]-> SPARK_KPI
+DAG_COMP    -[#7A4FB0,dotted]-> REST
+DAG_EXP     -[#7A4FB0,dotted]-> REST
+DAG_ORPH    -[#7A4FB0,dotted]-> REST
+DAG_HEALTH  -[#7A4FB0,dotted]-> TRINO
+
+' 가시성
+GOLD   --> TRINO
+SILVER --> TRINO
+BRONZE --> TRINO
+TRINO --> SUPERSET_BIZ
+TRINO --> SUPERSET_OPS
+TRINO --> HEALTH_SQL
+
+' 학술 비교 — Iceberg time-travel
+SILVER -[#2C6FB1,dashed]-> LSTM : "AS OF snapshot_id"
+LSTM --> GOLD : "model_metrics\n(MERGE)"
+
+' 페르소나 사용
+P1 -[#555555]-> SUPERSET_OPS
+P1 -[#555555]-> HEALTH_SQL
+P2 -[#555555]-> TRINO
+P2 -[#555555]-> LSTM
+P3 -[#555555]-> SUPERSET_BIZ
+
+legend bottom
+  | 색/형 | 의미 |
+  | <back:#FAFAFA>실선</back> | 데이터 흐름 (records) |
+  | <back:#FFF7E0>주황 점선</back> | Iceberg 메타데이터 / 스토리지 I/O |
+  | <back:#F5EFFA>보라 점선</back> | Airflow 스케줄 트리거 |
+  | <back:#EAF3FB>파랑 점선</back> | time-travel (AS OF snapshot) |
+endlegend
+
+@enduml
