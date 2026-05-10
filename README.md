@@ -148,91 +148,77 @@ event_ts = base_date  +  unit_jitter × unit_id  +  interval × (cycle − 1)
   |---|---|---|---|
   | `phm.gold.rul_prediction` | 엔진별 RUL 예측 + 신뢰구간 + `risk_tier`. `rul_actual`은 train 데이터에서만 유효 (test 시점에는 NULL) | `(model_version, dataset_id, days(predict_ts))` | `(model_version, dataset_id, unit_id, cycle)` |
   | `phm.gold.fleet_kpi_daily` | fleet 위험도·운영조건별 열화율 일배치 | `(months(kpi_date), dataset_id)` | `(kpi_date, dataset_id, op_condition_cluster)` |
-  | `phm.gold.model_metrics` | 모델 버전별 MAE / RMSE / PHM08 Score | `(model_version)` | `(model_version, dataset_id, eval_window_end)` |
+  | `phm.gold.model_metrics` | 모델 버전 × split (train / holdout / operational) × dataset 별 MAE / RMSE / PHM08 | `(model_version)` | `(model_version, dataset_id, eval_window_end, eval_split)` |
+  | `phm.gold.dq_results` | 데이터 품질 검증 결과 (NULL/finite/dup/cycle/rul/cluster/freshness/count/NaN; §5-2) | `(run_date)` | `(rule_name, layer, dataset_id, run_date)` |
+  | `phm.gold.pipeline_state` | 추론 watermark + active 모델 경로 (학습/추론 분리) | — | `(pipeline_name)` |
 
-- **모델**: 운영 Gold 파이프라인은 Spark MLlib `GBTRegressor` (단일 컨테이너에서 동작하는 v0 베이스라인). 학술 비교용 LSTM/CNN은 `experiments/lstm_baseline.py` 별도 실행.
-- **멱등**: 세 테이블 모두 MERGE INTO 적용 — 같은 키 재실행 시 UPDATE, 신규는 INSERT.
+- **모델 — 학습/추론 분리** (B 프레이밍, 운영 시스템 패턴):
+  - `gold_train_dag` (월 07:00, 주 1회): unit-level **80/20 holdout split** 으로 GBT 학습 → MinIO `s3a://warehouse/models/<model_version>/<ts>/` 에 PipelineModel 저장 → `model_metrics` 에 `train` / `holdout` 분리 기록 (정직한 일반화 성능) → `pipeline_state.active_model_path` 갱신.
+  - `gold_rul_predict_dag` (매시 :15): `pipeline_state.active_model_path` 에서 PipelineModel 로드 → silver 변경분 + 영향 unit 의 모든 cycle 추론 → `rul_prediction` MERGE. **재학습 X**.
+  - 이전 설계 (매 run train+predict 동시) 는 *데이터 누수* (train 데이터에서 추론) 였음 — `experiments/lstm_baseline.py` 가 보여주는 정직한 80/20 split 패턴을 운영 GBT 도 따르도록 정렬.
+- **모델 비교**: 학술 비교용 LSTM/CNN 은 `experiments/lstm_baseline.py` (별도 실행). 같은 `model_metrics` 테이블에 다른 `model_version` 으로 적재되어 SQL 한 줄 비교.
+- **멱등**: 세 테이블 모두 MERGE INTO — 같은 키 재실행 시 UPDATE, 신규는 INSERT.
 - **활용**: 대시보드 직접 쿼리, 시계열 일관성을 위해 time-travel 사용.
 
 ---
 
-## 4. Iceberg 가 *파이프라인 런타임* 으로 일하는 방식
+## 4. 왜 그냥 Parquet + Glue 가 아니라 Iceberg 인가?
 
-> **핵심 주장**: Iceberg 는 단순 *저장 포맷* 이 아니라 *증분 파이프라인의 런타임*. snapshot 자체가 watermark, changelog 자체가 CDC, MERGE 자체가 dedup — medallion 의 모든 단계가 별도 도구 없이 점진화·재현·검증 가능.
+> **요지**: 이 프로젝트가 *Iceberg 없이* 같은 요구사항(증분 ETL, 모델 데이터 재현, streaming 정합성, 멀티 엔진 read, DQ 시계열 추적, 운영 자동화)을 만족시키려면 **별도 시스템 / 보조 테이블 / 직접 구현 코드** 가 여러 군데로 분기된다. Iceberg 가 주는 실질 이득은 "신기능" 이 아니라 *분기됐을 책임을 한 카탈로그가 흡수해 운영 표면적이 줄어든다* 는 것. 8개 개별 기능을 아래 **3축** 으로 묶어, 각 축이 비-Iceberg 대비 무엇을 *없애는지* 만 정리한다.
 
-### 4-1. Snapshot = 증분 처리의 watermark
+### 4-1. Snapshot 하나로 — 증분 watermark + ML lineage + DQ 시계열
 
-Silver 가 Bronze 를 매시간 *전체 스캔* 하지 않는다. `phm.silver.pipeline_state.last_snapshot_id` 이후의 bronze 만 Iceberg `start-snapshot-id` 옵션으로 스캔 → 누적 N 과 무관한 비용으로 매시간 incremental.
+snapshot id 가 이 프로젝트의 세 군데에서 동시에 사용된다. 별도 메타 시스템 없이 *Iceberg 카탈로그 자체* 가 시계열 축 역할.
 
-- 코드: [code/pipelines/silver_transform.py](code/pipelines/silver_transform.py) `run_incremental` (`--mode incremental`)
-- 검증: [tests/integration/test_silver_incremental.py](tests/integration/test_silver_incremental.py) `test_incremental_matches_full` — incremental 결과가 full 과 비트 동일
-- 비-Iceberg: Hive Parquet 은 별도 watermark 컬럼 (예: `max(ingest_ts)`) + directory 스캔 필요. snapshot 단위의 *commit boundary* 가 없어 동시 streaming/batch write 시 race condition.
+| 용도 | 어디 | 효과 |
+|---|---|---|
+| 증분 ETL watermark | `phm.silver.pipeline_state.last_snapshot_id` + Iceberg `start-snapshot-id` 옵션 | Silver 가 Bronze 누적 N 과 무관한 비용으로 매시간 incremental |
+| ML 학습 데이터 lineage | `gold.model_metrics.silver_snapshot_id`, `gold.rul_prediction.silver_snapshot_id` | "이 모델이 어떤 Silver 상태로 학습됐나" 가 `AS OF snapshot` 으로 재현 |
+| DQ 결과 시계열 추적 | `phm.gold.dq_results` (Iceberg) | NaN 비율 추세 같은 시계열 추적이 `WHERE run_date BETWEEN ...` 한 줄 |
 
-### 4-2. silver_snapshot_id = ML 학습 데이터 lineage
+- 코드: [silver_transform.py](code/pipelines/silver_transform.py) `run_incremental`, [gold_rul_predict.py](code/pipelines/gold_rul_predict.py), [DDL 07](code/ddl/07_gold_dq_results.sql)
+- 검증: [test_silver_incremental.py](tests/integration/test_silver_incremental.py) `test_incremental_matches_full` — incremental 결과가 full 과 비트 동일
 
-`gold.model_metrics` 와 `gold.rul_prediction` 에 학습 시점 `silver_snapshot_id` 를 함께 기록. "이 모델이 어떤 Silver 상태로 학습됐나" 가 사후 `AS OF snapshot` 으로 재현 가능 → A/B 비교 시 *입력 데이터까지* 통제됨.
+**Parquet + Glue 라면 추가로 들었어야 할 것**: ① watermark 용 별도 컬럼 (`max(ingest_ts)`) + 디렉토리 스캔, ② 학습 데이터 archive (파일 복사 또는 lineage 보조 테이블), ③ Prometheus / 별도 metric store. 게다가 동시 streaming/batch write 시 *commit boundary* 부재로 race window 가 남는다.
 
-- 코드: [code/pipelines/gold_rul_predict.py](code/pipelines/gold_rul_predict.py) (snapshot id 추출 + metrics MERGE), [DDL 04/06](code/ddl/)
-- 비-Iceberg: Parquet partition + 파일 mtime 으로 흉내 가능하나, 동시 write 환경에서 *atomic snapshot boundary* 부재. "그 시점의 view" 를 재구성 불가.
+### 4-2. ACID write — at-least-once stream 을 exactly-once 로 마무리
 
-### 4-3. Append-only + dedup 분리 = throughput ⊥ consistency
+Spark Structured Streaming 은 본질적으로 at-least-once. 이 프로젝트는 두 단계로 정합성을 잡고, 그 자체를 자동 검증한다.
 
-Bronze 는 `writeTo(...).append()` — batch 마다 read 비용 0. Streaming at-least-once 의 dup 은 Silver 의 `dedup_bronze()` 가 row_number()=1 (first-write-wins) 로 흡수. 시스템 레벨 멱등성은 매일 `silver_count_matches_bronze` DQ rule 이 자동 검증.
+- **Bronze**: `writeTo(...).append()` 로 단순 append (batch 별 read 비용 0) — dup 가능성 인정
+- **Silver/Gold**: `MERGE INTO ... ON (멱등키)` 로 dedup — Silver `(dataset_id, unit_id, cycle)`, Gold rul `(model_version, dataset_id, unit_id, cycle)`, model_metrics `(model_version, dataset_id, eval_window_end)`, dq_results `(rule_name, layer, dataset_id, run_date)`
+- **자동 회귀 감시**: 매일 `silver_count_matches_bronze` DQ rule
 
-- 코드: [code/pipelines/bronze_ingest.py](code/pipelines/bronze_ingest.py) `append_batch`, [code/pipelines/silver_transform.py](code/pipelines/silver_transform.py) `dedup_bronze`, [code/pipelines/dq_check.py](code/pipelines/dq_check.py) `rule_silver_count_matches_bronze`
-- 비-Iceberg: Hive Parquet INSERT 는 가능하지만 *원자성* 부재 → partial write 가 reader 에 노출. dedup 을 어디 두든 일관성 보장 어려움.
+코드: [bronze_ingest.py](code/pipelines/bronze_ingest.py) `append_batch`, [silver_transform.py](code/pipelines/silver_transform.py) `dedup_bronze`, [dq_check.py](code/pipelines/dq_check.py)
 
-### 4-4. MERGE INTO = exactly-once 의 마지막 한 단계
+**Parquet + Glue 라면 추가로 들었어야 할 것**: ACID upsert 미지원 → staging table + INSERT OVERWRITE PARTITION 패턴 직접 구현. partial write 가 reader 에 노출되는 race window 존재. 재시도 안전성을 매 단계 직접 확보.
 
-Spark Structured Streaming 은 at-least-once. Iceberg `MERGE INTO ... ON (멱등키)` 가 그 위에 exactly-once 시맨틱을 얹음 — 별도 dedup 인프라 없이.
+### 4-3. Open table + 빌트인 운영 — 멀티 엔진 / hidden partition / 유지보수가 한 카탈로그 안
 
-- 적용 위치: Silver `(dataset_id, unit_id, cycle)`, Gold rul `(model_version, dataset_id, unit_id, cycle)`, model_metrics `(model_version, dataset_id, eval_window_end)`, dq_results `(rule_name, layer, dataset_id, run_date)`.
-- 비-Iceberg: ACID upsert 가 없는 Parquet/Hive 는 직접 staging table + INSERT OVERWRITE PARTITION 패턴 필요 — 코드량 ↑, 재시도 안전성 ↓.
+세 가지 운영 부담이 *추가 시스템 없이* 흡수된다.
 
-### 4-5. Hidden partitioning = 파티션 전략을 바꿔도 쿼리 무수정
+1. **멀티 엔진 read 일관성**: Spark MLlib (학습) ↔ Trino (BI/health-queries) ↔ Superset (대시보드) 이 *복제 없이* 같은 `phm.silver.engine_health` 를 read. ACID + time-travel 보장. → [infra/](infra/)
+2. **Hidden partitioning**: 사용자는 `WHERE ingest_ts > '2025-09-01'` 만 작성. partition 컬럼이 contract 에 노출되지 않아 `days(ingest_ts) → hours(ingest_ts)` 변경에도 다운스트림 쿼리 무수정. → [02_bronze DDL](code/ddl/02_bronze_engine_sensor_raw.sql)
+3. **유지보수 빌트인**: 작은 파일 폭증 / snapshot 누적 / orphan file 을 `rewrite_data_files` / `expire_snapshots` / `remove_orphan_files` 프로시저로 흡수, 일/주/월 DAG 로 자동화. → [code/maintenance/](code/maintenance/), [iceberg_compaction_dag](orchestration/dags/iceberg_compaction_dag.py), [iceberg_expire_dag](orchestration/dags/iceberg_expire_dag.py), [iceberg_orphan_cleanup_dag](orchestration/dags/iceberg_orphan_cleanup_dag.py)
 
-`dataset_id, days(ingest_ts)` 가 파티션이지만 사용자는 `WHERE ingest_ts > '2025-09-01'` 만 작성. partition 컬럼 자체가 노출되지 않아 `days` → `hours` 같은 전략 변경에도 다운스트림 무영향.
-
-- 코드: [02_bronze DDL](code/ddl/02_bronze_engine_sensor_raw.sql)
-- 비-Iceberg: Hive 는 partition 컬럼 (`partition_date`) 이 사용자 contract 에 포함됨. 전략 변경 시 모든 다운스트림 쿼리 + 백필 필요.
-
-### 4-6. 멀티 엔진 open table = 학습/BI/CEP 이 같은 테이블
-
-Spark MLlib (학습) ↔ Trino (BI/health-queries) ↔ Superset (대시보드) 이 *복제 없이* 같은 `phm.silver.engine_health` 를 read. 미래 Flink CEP 추가 시에도 같은 테이블 재사용 가능.
-
-- 인프라: [infra/](infra/) — Spark + Trino + Iceberg REST 동시 기동
-- 비-Iceberg: Parquet + Hive Metastore 는 *읽기 호환성* 만 제공. transactional consistency 와 time-travel 은 부재.
-
-### 4-7. 유지보수 빌트인 = rewrite / expire / orphan
-
-스트리밍이 만드는 작은 파일 폭증, snapshot 누적, orphan file 을 `rewrite_data_files` / `expire_snapshots` / `remove_orphan_files` 프로시저가 흡수. 일/주/월 단위 DAG 로 자동화.
-
-- 코드: [code/maintenance/](code/maintenance/) (4 SQL), DAG: [iceberg_compaction_dag](orchestration/dags/iceberg_compaction_dag.py), [iceberg_expire_dag](orchestration/dags/iceberg_expire_dag.py), [iceberg_orphan_cleanup_dag](orchestration/dags/iceberg_orphan_cleanup_dag.py)
-- 비-Iceberg: 모두 직접 구현 (small-file 배치 작업, snapshot 시뮬레이션, orphan 추적). 운영 비용 ↑.
-
-### 4-8. DQ 결과도 time-travel = 데이터 품질 추세 무비용 재현
-
-`phm.gold.dq_results` 도 Iceberg 테이블이라 time-travel 적용. "지난 분기 NaN 비율" 같은 시계열 추적이 외부 시계열 DB 없이 `SELECT ... WHERE run_date BETWEEN ...` 로 끝남.
-
-- 코드: [DDL 07](code/ddl/07_gold_dq_results.sql), [code/pipelines/dq_check.py](code/pipelines/dq_check.py)
-- 비-Iceberg: Prometheus 같은 별도 metric store 도입 → 인프라 표면 ↑.
+**Parquet + Glue 라면 추가로 들었어야 할 것**: ① Glue 는 *읽기 호환* 만 제공, transactional consistency 부재 → 엔진 간 일관성을 직접 확보. ② partition 컬럼이 사용자 contract 의 일부 → 전략 변경 시 모든 다운스트림 쿼리 수정 + 백필. ③ 작은 파일 압축 / snapshot GC / orphan 추적을 모두 직접 구현 (배치 작업 3종 + 모니터링).
 
 ### 한 줄 요약
 
-> 운영 시스템에서 *snapshot, changelog, MERGE, time-travel, hidden partitioning, multi-engine, auto-maintenance, DQ lineage* 가 한 카탈로그 안에 있는 게 Iceberg 의 가치. 이 8개 요소는 *각각* 별도 시스템으로 구현 가능하지만, *동시에* 갖추려면 표면적이 폭증한다. 이 프로젝트는 그 8개를 모두 *같은 테이블 위에서* 시연.
+> "Iceberg 의 모든 기능을 다 썼다" 가 가치 주장이 아니다. 가치 주장은 **"Parquet + Glue 였다면 4–5개 별도 시스템 / 보조 테이블 / 직접 구현 코드로 분기됐을 능력이 한 카탈로그 안에 있어 운영 표면적이 줄었다"** 다.
 
-### 비-Iceberg vs Iceberg — 항목별 매핑
+### Parquet + Glue 였다면 추가로 들었어야 할 것 — 항목별 매핑
 
-| 능력 | Hive + Parquet | Iceberg | 본 프로젝트 근거 |
+| 능력 | Parquet + Glue 의 부담 | Iceberg 가 흡수 | 본 프로젝트 근거 |
 |---|---|---|---|
-| 증분 처리 watermark | ingest_ts 컬럼 + directory scan | snapshot_id | §4-1, `silver_transform.run_incremental` |
-| ML 데이터 lineage | 파일 mtime 추정 | snapshot_id 컬럼 + AS OF | §4-2, `model_metrics.silver_snapshot_id` |
-| Streaming exactly-once | staging + INSERT OVERWRITE | MERGE INTO 멱등키 | §4-4, Silver/Gold/DQ |
-| 스키마 진화 | partition 별 호환 직접 관리 | ALTER TABLE | §4-5 |
-| Partition 추상화 | 사용자에게 노출 | hidden partitioning | §4-5, `days(ingest_ts)` |
-| 멀티 엔진 일관성 | 읽기 호환만 | ACID + time-travel | §4-6, Spark+Trino+Superset |
-| 작은 파일/snapshot 정리 | 직접 구현 | 빌트인 procedure | §4-7, `code/maintenance/` |
-| DQ 시계열 추적 | 별도 metric store | 같은 카탈로그의 한 테이블 | §4-8, `phm.gold.dq_results` |
+| 증분 ETL watermark | watermark 컬럼 + directory scan, race window | snapshot id + `start-snapshot-id` | §4-1 |
+| ML 학습 데이터 재현 | 파일 archive 또는 별도 lineage 테이블 | snapshot id 컬럼 + `AS OF` | §4-1 |
+| DQ 시계열 추적 | 별도 metric store (Prometheus 등) | 같은 카탈로그의 Iceberg 테이블 | §4-1 |
+| Streaming 정합성 | staging + INSERT OVERWRITE 직접 구현 | MERGE INTO 멱등키 | §4-2 |
+| 멀티 엔진 read | 읽기 호환만 (ACID 부재) | ACID + time-travel | §4-3 |
+| Partition 전략 변경 | 사용자 contract 변경 + 백필 | hidden partitioning | §4-3 |
+| 작은 파일 / snapshot / orphan | 직접 구현 (배치 3종) | 빌트인 procedure | §4-3 |
+| 스키마 진화 | partition 별 호환 직접 관리 | `ALTER TABLE` | §4-3 |
 
 ---
 

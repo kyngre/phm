@@ -29,6 +29,7 @@ EXPECTED_DAGS = {
     "silver_merge_dag":           {"schedule": "0 * * * *",    "tags": ["silver"]},
     "silver_fit_stats_dag":       {"schedule": "0 6 * * 1",    "tags": ["silver", "weekly"]},
     "gold_rul_predict_dag":      {"schedule": "15 * * * *",   "tags": ["gold", "ml"]},
+    "gold_train_dag":             {"schedule": "0 7 * * 1",    "tags": ["gold", "ml", "weekly"]},
     "gold_kpi_dag":              {"schedule": "30 0 * * *",   "tags": ["gold", "kpi"]},
     "iceberg_compaction_dag":    {"schedule": "0 3 * * *",    "tags": ["maintenance", "iceberg"]},
     "iceberg_expire_dag":        {"schedule": "0 4 * * *",    "tags": ["maintenance", "iceberg"]},

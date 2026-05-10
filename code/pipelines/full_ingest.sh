@@ -98,10 +98,10 @@ echo "▶ 8) Silver — full mode (KMeans fit + 전량 변환 + feat_stats/pipel
 docker exec -i "$SPARK" /opt/spark/bin/spark-submit --master 'local[*]' \
   /workspace/code/pipelines/silver_transform.py --mode full
 
-echo "▶ 9) Gold RUL 예측 (gbt-v0)"
+echo "▶ 9) Gold RUL — full mode (학습 80/20 holdout + 모델 저장 + 추론)"
 docker exec -i "$SPARK" /opt/spark/bin/spark-submit --master 'local[*]' \
   /workspace/code/pipelines/gold_rul_predict.py \
-  --model-version gbt-v0 --rul-cap 130
+  --mode full --model-version gbt-v0 --rul-cap 130
 
 echo "▶ 10) Gold KPI 일배치"
 docker exec -i "$SPARK" /opt/spark/bin/spark-submit --master 'local[*]' \

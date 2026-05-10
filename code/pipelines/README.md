@@ -5,7 +5,7 @@
 | `cmaps_to_kafka.py` | C-MAPSS txt 시뮬레이터 | `data/raw/train_FD00x.txt` | Kafka `phm.engine.sensor` |
 | `bronze_ingest.py` | Spark Structured Streaming (append-only, dedup 은 Silver) | Kafka | `phm.bronze.engine_sensor_raw` |
 | `silver_transform.py` | Bronze → Silver 변환 (`--mode full|fit-stats|incremental`) | Bronze + feat_stats + pipeline_state | `phm.silver.engine_health` (+ feat_stats / pipeline_state) |
-| `gold_rul_predict.py` | RUL 추론 (GBT v0) | Silver | `phm.gold.rul_prediction`, `phm.gold.model_metrics` |
+| `gold_rul_predict.py` | RUL 학습/추론 (`--mode train|predict|full`) — 80/20 unit holdout, MinIO 모델 저장, 변경분만 추론 | Silver + (PipelineModel + pipeline_state) | `phm.gold.rul_prediction`, `phm.gold.model_metrics` (train/holdout 분리), `phm.gold.pipeline_state` |
 | `gold_kpi_aggregate.py` | 일배치 KPI | Silver + Gold | `phm.gold.fleet_kpi_daily` |
 | `dq_check.py` | 데이터 품질 검증 (NULL/finite/dup/cycle/rul/cluster/freshness/count/NaN) | Bronze + Silver | `phm.gold.dq_results` |
 
@@ -32,7 +32,7 @@
 | 6 | 소화 대기 | 60s — streaming micro-batch 가 Bronze 까지 commit 하도록 |
 | 7 | Bronze 검증 | dataset 별 행수·unit 수·max cycle |
 | 8 | Silver `--mode full` | `silver_transform.py` — KMeans fit + 전량 변환 + feat_stats / pipeline_state 초기화 |
-| 9 | Gold RUL | `gold_rul_predict.py --model-version gbt-v0 --rul-cap 130` |
+| 9 | Gold RUL `--mode full` | `gold_rul_predict.py --mode full` — 80/20 holdout 학습 + 모델 저장 + 추론 |
 | 10 | Gold KPI | `gold_kpi_aggregate.py` |
 | 11 | 최종 검증 | bronze / silver / gold.rul / gold.kpi 레이어별 카운트 |
 

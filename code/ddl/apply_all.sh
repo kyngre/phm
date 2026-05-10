@@ -20,6 +20,7 @@ FILES=(
   "05_gold_fleet_kpi_daily.sql"
   "06_gold_model_metrics.sql"
   "07_gold_dq_results.sql"
+  "08_gold_pipeline_state.sql"
 )
 
 for f in "${FILES[@]}"; do

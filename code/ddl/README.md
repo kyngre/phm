@@ -11,6 +11,7 @@
 | `05_gold_fleet_kpi_daily.sql` | fleet 단위 KPI |
 | `06_gold_model_metrics.sql` | 모델 버전별 성능 지표 |
 | `07_gold_dq_results.sql` | 데이터 품질 검증 결과 (NULL/range/uniqueness/freshness; dq_check.py 출력) |
+| `08_gold_pipeline_state.sql` | Gold 추론 watermark + active 모델 경로 (학습/추론 분리 후 사용) |
 | `apply_all.sh` | 위 SQL 파일을 phm-spark 컨테이너에서 일괄 실행 |
 
 ## 적용

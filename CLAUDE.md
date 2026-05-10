@@ -57,8 +57,8 @@ data/_checkpoints/      Spark streaming checkpoint (호스트 bind mount, down -
 
 ## 모델 / 평가 현황
 
-- `gold_rul_predict.py` — Spark MLlib `GBTRegressor` (`gbt-v0`). train 으로 학습+추론 (누수). `phm.gold.rul_prediction` + `phm.gold.model_metrics`.
-- `experiments/lstm_baseline.py` — PyTorch LSTM (`lstm-v1`). unit-level 80/20 split.
+- `gold_rul_predict.py` — Spark MLlib `GBTRegressor` (`gbt-v0`). 3-mode (`train` / `predict` / `full`). unit-level 80/20 holdout split, MinIO `s3a://warehouse/models/<version>/<ts>/` 에 PipelineModel 저장, 추론은 `pipeline_state.active_model_path` 로드. `model_metrics` 에 `eval_split=train|holdout` 분리 기록.
+- `experiments/lstm_baseline.py` — PyTorch LSTM (`lstm-v1`). unit-level 80/20 split (위 GBT 와 동일 패턴).
 - **NASA test set + RUL_FD00x.txt 평가는 미적용** (학회용 표준 평가). 추가하려면 producer 의 `--include-test` + Silver 의 `is_test` 플래그 + RUL_FD00x.txt join 필요.
 - 결과 표 (전체 silver 기준):
   | dataset | GBT v0 MAE | LSTM v1 MAE |
@@ -77,6 +77,8 @@ data/_checkpoints/      Spark streaming checkpoint (호스트 bind mount, down -
 - **모델 멱등키 정책**: `(model_version, dataset_id, unit_id, cycle)` — 같은 모델 재실행 시 UPDATE, 새 모델은 새 행. version 으로 모델 비교 자동화.
 - **Bronze append-only + Silver dedup**: Bronze 는 `MERGE INTO` 미사용 — `writeTo(...).append()` 로 batch 마다 read 비용 0. Spark Streaming at-least-once 의 dup 은 Silver 진입의 `dedup_bronze()` (`row_number()=1` over `(source_file, line_no)`, first-write-wins) 가 흡수. 운영 시스템에서 트래픽 증가 시 Bronze write 비용이 데이터 누적과 무관해지는 패턴 시연.
 - **Silver 증분 처리**: 매시간 `silver_merge_dag` 가 `--mode incremental` 호출. `phm.silver.pipeline_state.last_snapshot_id` 이후 bronze 변경분만 Iceberg `start-snapshot-id` 옵션으로 스캔, 영향 `(dataset, unit)` 의 모든 cycle 을 재변환 (rolling window + rul_label 정확성). KMeans/cluster 통계는 주 1회 `silver_fit_stats_dag` 가 `phm.silver.feat_stats` 에 갱신.
+- **Gold 학습/추론 분리**: 이전엔 매 run train+predict 동시 (학습 데이터에 추론 = 누수). 분리 후 — `gold_train_dag` (월 07:00, 주 1회) 가 unit-level 80/20 holdout 으로 GBT fit + MinIO 저장 + `model_metrics` 에 train/holdout 분리 기록. `gold_rul_predict_dag` (매시 :15) 는 저장 모델 로드, silver 변경분만 추론. `phm.gold.pipeline_state.active_model_path` 가 활성 모델 포인터. PipelineModel 저장 경로: `s3a://warehouse/models/<version>/<ts>/`.
+- **데이터 품질 vs 운영 메트릭 분리**: `code/health-queries/` (Trino, 매시간) = 인프라 시그널 (snapshot 추이, drift, dropout). `code/pipelines/dq_check.py` (Spark, 매일) = *데이터 자체* (NULL/finite/dup/cycle/rul/cluster/freshness/count/NaN). 같은 대시보드에 섞으면 알람 우선순위 깨짐 — DAG / 테이블 / 대시보드 탭 모두 분리.
 
 ## 작업 시 우선 확인할 것
 
