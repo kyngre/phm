@@ -12,7 +12,8 @@ Airflow standalone (SQLite + SequentialExecutor) on `phm-airflow`. UI: http://lo
 | `iceberg_compaction_dag` | `0 3 * * *` | rewrite_data_files + rewrite_manifests |
 | `iceberg_expire_dag` | `0 4 * * *` | expire_snapshots (older_than = NOW − 90d) |
 | `iceberg_orphan_cleanup_dag` | `0 5 * * 0` | remove_orphan_files (주배치) |
-| `health_check_dag` | `30 * * * *` | health-queries 8종 Trino 실행 |
+| `health_check_dag` | `30 * * * *` | health-queries 8종 Trino 실행 (운영 메트릭) |
+| `dq_check_dag` | `0 1 * * *` | 데이터 품질 검증 (NULL/finite/dup/cycle/rul/cluster/freshness/count/NaN) → `phm.gold.dq_results` |
 
 ## 실행 패턴
 

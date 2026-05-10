@@ -34,6 +34,7 @@ EXPECTED_DAGS = {
     "iceberg_expire_dag":        {"schedule": "0 4 * * *",    "tags": ["maintenance", "iceberg"]},
     "iceberg_orphan_cleanup_dag":{"schedule": "0 5 * * 0",    "tags": ["maintenance", "iceberg"]},
     "health_check_dag":          {"schedule": "30 * * * *",   "tags": ["health"]},
+    "dq_check_dag":               {"schedule": "0 1 * * *",    "tags": ["health", "dq"]},
 }
 
 

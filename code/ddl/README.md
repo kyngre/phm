@@ -10,6 +10,7 @@
 | `04_gold_rul_prediction.sql` | 엔진별 RUL 예측 |
 | `05_gold_fleet_kpi_daily.sql` | fleet 단위 KPI |
 | `06_gold_model_metrics.sql` | 모델 버전별 성능 지표 |
+| `07_gold_dq_results.sql` | 데이터 품질 검증 결과 (NULL/range/uniqueness/freshness; dq_check.py 출력) |
 | `apply_all.sh` | 위 SQL 파일을 phm-spark 컨테이너에서 일괄 실행 |
 
 ## 적용

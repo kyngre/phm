@@ -168,7 +168,11 @@ event_ts = base_date  +  unit_jitter × unit_id  +  interval × (cycle − 1)
 
 ---
 
-## 5. 운영 헬스 체크 쿼리 모음
+## 5. 운영 헬스 체크 + 데이터 품질 검증
+
+두 축으로 분리:
+
+### 5-1. 운영 헬스 체크 (Trino, 매시간)
 
 `code/health-queries/` 참고. 매일 5분 안에 헬스체크 가능한 8개 쿼리:
 
@@ -180,6 +184,31 @@ event_ts = base_date  +  unit_jitter × unit_id  +  interval × (cycle − 1)
 6. Silver MERGE commit 패턴 (replace 비율·추가/삭제 행수; OCC 실제 충돌은 Spark log에서 확인)
 7. 운영조건 클러스터 분포 변화 (data drift)
 8. `model_version` 별 예측 일관성 (동일 테이블 내 버전 간 self JOIN — time-travel 아님)
+
+DAG: `health_check_dag` — 매시 :30. **운영 메트릭 (인프라/snapshot/drift)** 위주.
+
+### 5-2. 데이터 품질 검증 (Spark, 일배치)
+
+`code/pipelines/dq_check.py` — *데이터 자체* 의 품질을 9개 rule 로 측정해
+`phm.gold.dq_results (rule_name, layer, dataset_id, run_date)` 에 멱등 MERGE.
+
+| rule | layer | 임계 | 의미 |
+|---|---|---|---|
+| `bronze_null_key_columns` | bronze | 0 행 | unit_id/cycle 가 NULL 인 행 수 |
+| `bronze_finite_sensors` | bronze | 0 행 | sensor_1~21 중 NaN/Inf/NULL |
+| `bronze_dup_ratio` | bronze | < 1% | (source_file, line_no) dup 비율 (Silver dedup 이 흡수, 폭주 시 streaming 재시도 의심) |
+| `bronze_cycle_monotonic` | bronze | 0 unit | cycle 1..N 연속이 아닌 unit 수 (dedup 후) |
+| `silver_rul_label_nonneg` | silver | 0 행 | rul_label NULL/음수 |
+| `silver_cluster_in_range` | silver | 0 행 | op_condition_cluster 가 [0, 5] 외부 |
+| `silver_freshness_minutes` | silver | ≤ 120분 | max(silver_ts) 와 현재 시각 간격 |
+| `silver_count_matches_bronze` | silver | 차이 0 | silver 행 수 == bronze dedup 행 수 |
+| `silver_nan_feature_ratio` | silver | ≤ 5% | s*_norm + rolling 의 NaN 비율 (rolling 시작부 정상치 5% 한계) |
+
+각 결과: PASS / WARN / FAIL (warn_factor=1.5, 임계 초과지만 1.5× 이내면 WARN).
+
+DAG: `dq_check_dag` — 매일 01:00 (gold_kpi 30분 후, compaction 2시간 전). 실패 시 다음 단계 차단은 미적용 (관측 우선); FAIL 발생 시 외부 alerting 권장.
+
+**5-1 vs 5-2 의 분리 이유**: 운영 메트릭은 *인프라 시그널*, DQ 는 *데이터 시그널*. 같은 대시보드에 섞으면 알람 노이즈와 우선순위가 망가짐.
 
 ---
 
@@ -206,7 +235,7 @@ event_ts = base_date  +  unit_jitter × unit_id  +  interval × (cycle − 1)
 
 ## 8. 장애·운영 시나리오
 
-1. **Streaming OOM**: `full_ingest.sh`가 DDL 재적용 직후 Bronze checkpoint를 자동 삭제(step 3.5)하므로 스크립트 재실행으로 복구 가능. 수동 복구 시 `data/_checkpoints/bronze_engine_sensor_raw/` 삭제 후 재기동. Bronze 멱등키 `(source_file, line_no)` 덕분에 중복 적재 없음.
+1. **Streaming OOM**: `full_ingest.sh`가 DDL 재적용 직후 Bronze checkpoint를 자동 삭제(step 3.5)하므로 스크립트 재실행으로 복구 가능. 수동 복구 시 `data/_checkpoints/bronze_engine_sensor_raw/` 삭제 후 재기동. Bronze 는 append-only 라 재시도 시 dup 이 발생할 수 있으나 Silver 진입의 `dedup_bronze()` 가 흡수 → 시스템 행 수는 동일.
 2. **3개월 백필**: producer를 아래 커맨드로 재실행 → Silver MERGE → Gold 재집계. 같은 자연키(dataset/unit/cycle)면 UPDATE, event_ts 만 바뀜. **expire 정책 = 100일 (학습 윈도우 90d + 안전 마진 10d)** — Bronze/Silver DDL `history.expire.max-snapshot-age-ms = 8_640_000_000` 와 `iceberg_expire_dag.OLDER_THAN_DAYS = 100` 두 곳에 동기화. `tests/dags/test_backfill_safety.py` 가 두 값의 일치와 마진 ≥ 7d 를 강제.
    ```bash
    # Linux/WSL
@@ -223,9 +252,10 @@ event_ts = base_date  +  unit_jitter × unit_id  +  interval × (cycle − 1)
 
 ## 9. 멱등성 / 재처리 가능성 설계
 
-- **Bronze**: `(source_file, line_no)` 유니크 → `WHEN NOT MATCHED THEN INSERT *` 만 실행 (기존 행 수정 없음).
-- **Silver**: `MERGE INTO ... ON (dataset_id, unit_id, cycle)` — matched UPDATE + not matched INSERT. KMeans `seed=42` 조건 하에 동일 입력 N회 → 동일 결과.
+- **Bronze**: append-only (`writeTo(...).append()`). batch 마다 read 비용 0. 시스템 레벨 멱등성은 **Silver 진입의 `dedup_bronze()`** 가 `(source_file, line_no)` row_number=1 (first-write-wins) 으로 흡수. Spark Streaming foreachBatch 의 at-least-once 로 발생하는 dup 을 한 단계 늦게 dedup 함으로써 Bronze 의 write 비용을 데이터 누적과 무관한 *일정 비용* 으로 유지.
+- **Silver**: `MERGE INTO ... ON (dataset_id, unit_id, cycle)` — matched UPDATE + not matched INSERT. KMeans `seed=42` + `stable_cluster_ids` 조건 하에 동일 입력 N회 → 동일 결과. 매시간 `silver_merge_dag` 가 `--mode incremental` (last_snapshot_id 이후 변경분만 + 영향 unit 의 모든 cycle 재변환). 주 1회 `silver_fit_stats_dag` 가 KMeans/통계 재학습.
 - **Gold**: `(model_version, dataset_id, unit_id, cycle)` 키 — matched UPDATE + not matched INSERT. `predict_ts` + `silver_snapshot_id` 기록으로 time-travel 재현.
+- **DQ**: `(rule_name, layer, dataset_id, run_date)` 키 — 같은 날 dq_check 재실행 시 UPDATE.
 - **백필 절차**:
   ```sql
   -- ① 태그 생성
