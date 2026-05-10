@@ -36,8 +36,11 @@ CREATE TABLE phm.silver.engine_health (
     -- Health Index (낮을수록 열화)
     health_index DOUBLE,
 
-    -- 라벨 (학습용; 테스트셋은 RUL_FDxxx.txt에서 채움)
-    rul_label    INT     COMMENT 'NULL이면 정답 미정',
+    -- 라벨 (train trajectory: max(cycle) - cycle / test trajectory: NULL)
+    rul_label    INT     COMMENT 'NULL이면 정답 미정 (test 는 rul_ground_truth 참조)',
+
+    -- NASA 평가 분리
+    is_test      BOOLEAN COMMENT 'true 면 source_file = test_FDxxx.txt — 학습 제외, NASA 표준 평가 대상',
 
     -- 메타
     event_ts        TIMESTAMP,

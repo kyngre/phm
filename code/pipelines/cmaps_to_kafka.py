@@ -66,8 +66,14 @@ def parse_line(line: str) -> dict | None:
     return rec
 
 
-def iter_dataset(dataset_id: str, max_units: int | None):
-    src = DATA_DIR / f"train_{dataset_id}.txt"
+def iter_dataset(dataset_id: str, max_units: int | None,
+                 source: str = "train"):
+    """source ∈ {'train', 'test'} — train_FDxxx.txt 또는 test_FDxxx.txt 발행.
+
+    test 행은 같은 토픽으로 가지만 source_file 값이 'test_FDxxx.txt' 라
+    Silver 의 dedup_bronze 후 is_test 플래그 derivation 가능.
+    """
+    src = DATA_DIR / f"{source}_{dataset_id}.txt"
     if not src.exists():
         raise FileNotFoundError(src)
     with src.open() as f:
@@ -95,6 +101,8 @@ def main():
     ap.add_argument("--datasets", default="FD001,FD002,FD003,FD004")
     ap.add_argument("--max-units", type=int, default=None,
                     help="dataset 당 최대 unit 수 (시연용)")
+    ap.add_argument("--include-test", action="store_true",
+                    help="test_FDxxx.txt 도 발행 (NASA 표준 평가용). source_file 으로 구분.")
 
     # ── time-travel 시뮬 인자 ──
     ap.add_argument("--base-date", default="2025-08-01",
@@ -139,9 +147,12 @@ def main():
         )
 
     datasets = [d.strip() for d in args.datasets.split(",") if d.strip()]
+    sources = ["train"] + (["test"] if args.include_test else [])
+    print(f"[sim] datasets={datasets}, sources={sources}", flush=True)
     total = 0
     t0 = time.time()
-    iters = [iter(iter_dataset(d, args.max_units)) for d in datasets]
+    iters = [iter(iter_dataset(d, args.max_units, source=src))
+             for d in datasets for src in sources]
     active = list(range(len(iters)))
     min_ts, max_ts = None, None
     while active:

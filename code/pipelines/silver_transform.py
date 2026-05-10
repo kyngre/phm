@@ -48,7 +48,7 @@ TARGET_COLS = (
      "op_condition_cluster"]
     + [f"s{s}_norm" for s in KEEP_SENSORS]
     + ["s_avg_w5", "s_std_w5", "s_trend_w5",
-       "health_index", "rul_label",
+       "health_index", "rul_label", "is_test",
        "event_ts", "ingest_ts", "silver_ts", "silver_version"]
 )
 
@@ -195,12 +195,30 @@ def add_health_index(df, src_col: str = "s_avg_w5"):
     )
 
 
+def add_is_test_flag(df):
+    """source_file 의 prefix 로 train/test trajectory 구분.
+
+    train_FDxxx.txt → is_test=False (run-to-failure → rul_label 자체 계산 가능)
+    test_FDxxx.txt  → is_test=True  (partial → rul_label NULL, ground truth 별도 join)
+    """
+    if "source_file" not in df.columns:
+        # 정상 경로 (bronze.join 결과) 가 아닌 경우의 안전망 — 모두 train 으로 가정.
+        return df.withColumn("is_test", F.lit(False))
+    return df.withColumn(
+        "is_test",
+        F.col("source_file").startswith("test_"),
+    )
+
+
 def add_rul_label(df):
-    """train 가정: 마지막 cycle = 고장. rul_label = max(cycle) - cycle (per engine)."""
+    """train trajectory: rul_label = max(cycle) - cycle (per engine).
+    test trajectory  : rul_label = NULL (정답은 phm.silver.rul_ground_truth 참조).
+    """
     engine_all_w = Window.partitionBy("dataset_id", "unit_id")
     return df.withColumn(
         "rul_label",
-        F.max("cycle").over(engine_all_w) - F.col("cycle"),
+        F.when(F.col("is_test"), F.lit(None).cast("int"))
+         .otherwise(F.max("cycle").over(engine_all_w) - F.col("cycle")),
     )
 
 
@@ -445,10 +463,11 @@ def run_full(spark: SparkSession, args) -> None:
     # 2) z-score (현재 배치 통계로 — fit 결과와 동치)
     df = apply_zscore_inline(clustered)
 
-    # 3-5) rolling / HI / rul_label
+    # 3-5) rolling / HI / is_test / rul_label
     df = add_rolling_features(df, [f"s{s}_norm" for s in KEEP_SENSORS],
                               window=args.rolling_window)
     df = add_health_index(df)
+    df = add_is_test_flag(df)
     df = add_rul_label(df)
 
     # 6) silver MERGE
@@ -545,10 +564,11 @@ def run_incremental(spark: SparkSession, args) -> None:
     df = assign_cluster_from_centroids(target, sorted_centers)
     # 2) z-score (feat_stats 의 mean/std 사용)
     df = apply_zscore_from_stats(df, stats_df)
-    # 3-5) rolling / HI / rul_label
+    # 3-5) rolling / HI / is_test / rul_label
     df = add_rolling_features(df, [f"s{s}_norm" for s in KEEP_SENSORS],
                               window=args.rolling_window)
     df = add_health_index(df)
+    df = add_is_test_flag(df)
     df = add_rul_label(df)
     # 6) MERGE
     n = finalize_and_merge_silver(df, args.silver_version)

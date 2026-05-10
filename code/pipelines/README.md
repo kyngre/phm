@@ -8,6 +8,7 @@
 | `gold_rul_predict.py` | RUL 학습/추론 (`--mode train|predict|full`) — 80/20 unit holdout, MinIO 모델 저장, 변경분만 추론 | Silver + (PipelineModel + pipeline_state) | `phm.gold.rul_prediction`, `phm.gold.model_metrics` (train/holdout 분리), `phm.gold.pipeline_state` |
 | `gold_kpi_aggregate.py` | 일배치 KPI | Silver + Gold | `phm.gold.fleet_kpi_daily` |
 | `dq_check.py` | 데이터 품질 검증 (NULL/finite/dup/cycle/rul/cluster/freshness/count/NaN) | Bronze + Silver | `phm.gold.dq_results` |
+| `load_rul_ground_truth.py` | RUL_FDxxx.txt → silver 정답 RUL 적재 (NASA 표준 평가용) | `data/raw/RUL_FDxxx.txt` | `phm.silver.rul_ground_truth` |
 
 ---
 
@@ -28,7 +29,8 @@
 | 2 | Kafka 토픽 | `phm.engine.sensor` (4 partitions) `--if-not-exists` |
 | 3 | Python 의존성 | `phm-spark` 컨테이너에 `kafka-python`, `numpy` 설치 (root 1회) |
 | 4 | Bronze streaming 기동 | `bronze_ingest.py` 를 백그라운드로 띄움 (자세한 동작은 아래) |
-| 5 | Producer | `cmaps_to_kafka.py --datasets FD001,FD002,FD003,FD004 --cycle-interval 1 --speedup 1000` — Kafka 로 raw 발행 |
+| 5 | Producer | `cmaps_to_kafka.py --datasets FD001~FD004 --include-test --cycle-interval 1 --speedup 1000` — train + test trajectory 모두 Kafka 발행 |
+| 5b | RUL ground truth 적재 | `load_rul_ground_truth.py` — RUL_FDxxx.txt → `phm.silver.rul_ground_truth` (NASA 표준 평가 입력) |
 | 6 | 소화 대기 | 60s — streaming micro-batch 가 Bronze 까지 commit 하도록 |
 | 7 | Bronze 검증 | dataset 별 행수·unit 수·max cycle |
 | 8 | Silver `--mode full` | `silver_transform.py` — KMeans fit + 전량 변환 + feat_stats / pipeline_state 초기화 |

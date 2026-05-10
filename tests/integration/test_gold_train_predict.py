@@ -15,6 +15,9 @@ import pytest
 pytest.importorskip("pyspark", reason="integration tests require pyspark")
 
 from pyspark.sql import functions as F  # noqa: E402
+from pyspark.sql.types import (  # noqa: E402
+    BooleanType, DoubleType, IntegerType, StringType, StructField, StructType, TimestampType,
+)
 
 import gold_rul_predict as gp  # noqa: E402
 
@@ -29,6 +32,7 @@ NORM_COLS = ", ".join(f"s{s}_norm DOUBLE" for s in gp.KEEP_SENSORS)
 def _create_tables(spark):
     spark.sql("CREATE NAMESPACE IF NOT EXISTS test.gold")
     spark.sql("DROP TABLE IF EXISTS test.silver.engine_health")
+    spark.sql("DROP TABLE IF EXISTS test.silver.rul_ground_truth")
     spark.sql("DROP TABLE IF EXISTS test.gold.rul_prediction")
     spark.sql("DROP TABLE IF EXISTS test.gold.model_metrics")
     spark.sql("DROP TABLE IF EXISTS test.gold.pipeline_state")
@@ -40,7 +44,7 @@ def _create_tables(spark):
             op_condition_cluster INT,
             {NORM_COLS},
             s_avg_w5 DOUBLE, s_std_w5 DOUBLE, s_trend_w5 DOUBLE,
-            health_index DOUBLE, rul_label INT,
+            health_index DOUBLE, rul_label INT, is_test BOOLEAN,
             event_ts TIMESTAMP, ingest_ts TIMESTAMP, silver_ts TIMESTAMP,
             silver_version STRING
         )
@@ -87,57 +91,85 @@ def _create_tables(spark):
         TBLPROPERTIES ('format-version' = '2', 'write.merge.mode' = 'copy-on-write')
     """)
 
+    spark.sql("""
+        CREATE TABLE test.silver.rul_ground_truth (
+            dataset_id STRING, unit_id INT, true_rul INT, loaded_ts TIMESTAMP
+        )
+        USING iceberg
+        PARTITIONED BY (dataset_id)
+        TBLPROPERTIES ('format-version' = '2', 'write.merge.mode' = 'copy-on-write')
+    """)
 
-def _seed_silver(spark, n_units=10, n_cycles=30):
-    """unit_level_split 가 80/20 분할되도록 충분한 unit 수 + 학습 가능한 신호."""
+
+def _silver_schema():
+    """PySpark 가 None-only 컬럼 (rul_label when is_test) 의 타입을 추론 못 함 →
+    명시적 StructType."""
+    fields = [
+        StructField("dataset_id", StringType()),
+        StructField("unit_id", IntegerType()),
+        StructField("cycle", IntegerType()),
+        StructField("op_setting_1", DoubleType()),
+        StructField("op_setting_2", DoubleType()),
+        StructField("op_setting_3", DoubleType()),
+        StructField("op_condition_cluster", IntegerType()),
+    ]
+    fields += [StructField(f"s{s}_norm", DoubleType()) for s in gp.KEEP_SENSORS]
+    fields += [
+        StructField("s_avg_w5", DoubleType()),
+        StructField("s_std_w5", DoubleType()),
+        StructField("s_trend_w5", DoubleType()),
+        StructField("health_index", DoubleType()),
+        StructField("rul_label", IntegerType()),
+        StructField("is_test", BooleanType()),
+        StructField("event_ts", TimestampType()),
+        StructField("ingest_ts", TimestampType()),
+        StructField("silver_ts", TimestampType()),
+        StructField("silver_version", StringType()),
+    ]
+    return StructType(fields)
+
+
+def _seed_silver(spark, n_units=10, n_cycles=30, *, is_test=False, unit_offset=0,
+                 rul_label_override=None):
+    """unit_level_split 가 80/20 분할되도록 충분한 unit 수 + 학습 가능한 신호.
+
+    is_test=True 면 rul_label=NULL (NASA test 시맨틱). unit_offset 으로 train/test 의
+    unit_id 를 분리해 같은 silver 테이블에 mix 할 수 있음.
+    """
     rows = []
-    for u in range(1, n_units + 1):
+    base_ts = datetime(2025, 8, 1, tzinfo=timezone.utc)
+    now = datetime.now(tz=timezone.utc)
+    for u in range(1 + unit_offset, n_units + 1 + unit_offset):
         max_c = n_cycles
         for c in range(1, n_cycles + 1):
-            # 단순한 선형 신호: rul 이 줄수록 health_index 도 줄어듦
             health = 1.0 - (max_c - c) / max_c
-            rows.append({
-                "dataset_id": "FD001", "unit_id": u, "cycle": c,
-                "op_setting_1": 0.0, "op_setting_2": 0.0, "op_setting_3": 100.0,
-                "op_condition_cluster": 0,
-                **{f"s{s}_norm": health * 0.5 + (s % 3) * 0.01 for s in gp.KEEP_SENSORS},
-                "s_avg_w5": health, "s_std_w5": 0.1, "s_trend_w5": -0.05,
-                "health_index": health, "rul_label": max_c - c,
-                "event_ts": datetime(2025, 8, 1, tzinfo=timezone.utc),
-                "ingest_ts": datetime(2025, 8, 1, tzinfo=timezone.utc),
-                "silver_ts": datetime.now(tz=timezone.utc),
-                "silver_version": "v1",
-            })
-    df = spark.createDataFrame(rows)
-    cols = [
-        "dataset_id", "unit_id", "cycle",
-        "op_setting_1", "op_setting_2", "op_setting_3", "op_condition_cluster",
-        *(f"s{s}_norm" for s in gp.KEEP_SENSORS),
-        "s_avg_w5", "s_std_w5", "s_trend_w5",
-        "health_index", "rul_label",
-        "event_ts", "ingest_ts", "silver_ts", "silver_version",
-    ]
-    df = df.select(
-        F.col("dataset_id").cast("string"),
-        F.col("unit_id").cast("int"),
-        F.col("cycle").cast("int"),
-        F.col("op_setting_1").cast("double"),
-        F.col("op_setting_2").cast("double"),
-        F.col("op_setting_3").cast("double"),
-        F.col("op_condition_cluster").cast("int"),
-        *(F.col(c).cast("double") for c in (f"s{s}_norm" for s in gp.KEEP_SENSORS)),
-        F.col("s_avg_w5").cast("double"),
-        F.col("s_std_w5").cast("double"),
-        F.col("s_trend_w5").cast("double"),
-        F.col("health_index").cast("double"),
-        F.col("rul_label").cast("int"),
-        F.col("event_ts").cast("timestamp"),
-        F.col("ingest_ts").cast("timestamp"),
-        F.col("silver_ts").cast("timestamp"),
-        F.col("silver_version").cast("string"),
-    ).toDF(*cols)
+            rl = (None if is_test
+                  else (rul_label_override if rul_label_override is not None
+                        else max_c - c))
+            tup = (
+                "FD001", u, c,
+                0.0, 0.0, 100.0,
+                0,
+                *(health * 0.5 + (s % 3) * 0.01 for s in gp.KEEP_SENSORS),
+                health, 0.1, -0.05,
+                health, rl, is_test,
+                base_ts, base_ts, now, "v1",
+            )
+            rows.append(tup)
+    df = spark.createDataFrame(rows, schema=_silver_schema())
     df.createOrReplaceTempView("_s")
     spark.sql("INSERT INTO test.silver.engine_health SELECT * FROM _s")
+
+
+def _seed_rul_ground_truth(spark, units_with_rul: dict[int, int]):
+    """test_FD001.txt 의 unit_id → 정답 RUL dict 를 silver.rul_ground_truth 에 적재."""
+    rows = [("FD001", u, r) for u, r in units_with_rul.items()]
+    df = (
+        spark.createDataFrame(rows, schema="dataset_id STRING, unit_id INT, true_rul INT")
+             .withColumn("loaded_ts", F.current_timestamp())
+    )
+    df.createOrReplaceTempView("_gt")
+    spark.sql("INSERT INTO test.silver.rul_ground_truth SELECT * FROM _gt")
 
 
 @pytest.fixture
@@ -148,11 +180,13 @@ def gold_env(iceberg_spark, monkeypatch, tmp_path):
     monkeypatch.setattr(gp, "RUL_TABLE", "test.gold.rul_prediction")
     monkeypatch.setattr(gp, "METRICS_TABLE", "test.gold.model_metrics")
     monkeypatch.setattr(gp, "PIPELINE_STATE_TABLE", "test.gold.pipeline_state")
+    monkeypatch.setattr(gp, "RUL_GROUND_TRUTH_TABLE", "test.silver.rul_ground_truth")
     # 모델 저장 경로 — Iceberg 와 별개의 로컬 파일 시스템
     monkeypatch.setattr(gp, "MODEL_BASE_PATH", f"file://{tmp_path}/models")
     yield iceberg_spark
-    for t in ("test.silver.engine_health", "test.gold.rul_prediction",
-              "test.gold.model_metrics", "test.gold.pipeline_state"):
+    for t in ("test.silver.engine_health", "test.silver.rul_ground_truth",
+              "test.gold.rul_prediction", "test.gold.model_metrics",
+              "test.gold.pipeline_state"):
         iceberg_spark.sql(f"DROP TABLE IF EXISTS {t}")
 
 
@@ -212,6 +246,68 @@ class TestGoldTrain:
         assert state["active_model_version"] == "gbt-v0"
         assert state["active_model_path"] is not None
         assert state["active_model_trained_ts"] is not None
+
+
+class TestNasaTestEval:
+    """NASA C-MAPSS 표준 평가 — eval_split='nasa_test' 행이 model_metrics 에 들어가야 함."""
+
+    def test_nasa_eval_emits_metrics_row_when_data_available(self, gold_env):
+        """is_test silver + rul_ground_truth 가 모두 있으면 nasa_test 행 생성."""
+        spark = gold_env
+        # train trajectory: unit 1~10
+        _seed_silver(spark, n_units=10, n_cycles=20, is_test=False)
+        # test trajectory: unit 11~13 (rul_label NULL)
+        _seed_silver(spark, n_units=3, n_cycles=15, is_test=True, unit_offset=10)
+        # ground truth — test units 의 정답 RUL
+        _seed_rul_ground_truth(spark, {11: 30, 12: 50, 13: 70})
+
+        gp.run_train(spark, _args("train"))
+
+        spark.sql("REFRESH TABLE test.gold.model_metrics")
+        rows = spark.sql("""
+            SELECT eval_split, sample_count
+              FROM test.gold.model_metrics
+             WHERE model_version='gbt-v0'
+        """).collect()
+        splits = {r["eval_split"] for r in rows}
+        assert "nasa_test" in splits, f"nasa_test split 누락: {splits}"
+        # 3 test unit × 1 dataset → sample_count=3 인 nasa_test 행 한 개
+        nasa = next(r for r in rows if r["eval_split"] == "nasa_test")
+        assert nasa["sample_count"] == 3
+
+    def test_nasa_eval_skipped_without_test_rows(self, gold_env):
+        """is_test silver 행이 없으면 nasa_test 행 미생성 (skip)."""
+        spark = gold_env
+        _seed_silver(spark, n_units=10, n_cycles=20, is_test=False)
+        # ground truth 없음 + test 행도 없음
+
+        gp.run_train(spark, _args("train"))
+
+        spark.sql("REFRESH TABLE test.gold.model_metrics")
+        rows = spark.sql("""
+            SELECT eval_split FROM test.gold.model_metrics
+             WHERE model_version='gbt-v0'
+        """).collect()
+        splits = {r["eval_split"] for r in rows}
+        assert "nasa_test" not in splits, "test 데이터 없는데 nasa_test 행 생성됨"
+        assert "train" in splits and "holdout" in splits
+
+    def test_nasa_eval_skipped_without_ground_truth(self, gold_env):
+        """is_test 행은 있지만 rul_ground_truth 가 비어 있으면 skip."""
+        spark = gold_env
+        _seed_silver(spark, n_units=10, n_cycles=20, is_test=False)
+        _seed_silver(spark, n_units=3, n_cycles=15, is_test=True, unit_offset=10)
+        # ground truth 의도적으로 비워둠
+
+        gp.run_train(spark, _args("train"))
+
+        spark.sql("REFRESH TABLE test.gold.model_metrics")
+        rows = spark.sql("""
+            SELECT eval_split FROM test.gold.model_metrics
+             WHERE model_version='gbt-v0'
+        """).collect()
+        splits = {r["eval_split"] for r in rows}
+        assert "nasa_test" not in splits
 
 
 class TestGoldPredict:

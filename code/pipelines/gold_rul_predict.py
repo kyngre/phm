@@ -34,7 +34,7 @@ import time
 from pyspark.ml import Pipeline, PipelineModel
 from pyspark.ml.feature import VectorAssembler
 from pyspark.ml.regression import GBTRegressor
-from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 
 KEEP_SENSORS = [2, 3, 4, 7, 8, 9, 11, 12, 13, 14, 15, 17, 20, 21]
@@ -56,6 +56,7 @@ SILVER_TABLE = "phm.silver.engine_health"
 RUL_TABLE = "phm.gold.rul_prediction"
 METRICS_TABLE = "phm.gold.model_metrics"
 PIPELINE_STATE_TABLE = "phm.gold.pipeline_state"
+RUL_GROUND_TRUTH_TABLE = "phm.silver.rul_ground_truth"
 PIPELINE_NAME = "gold_rul_predict"
 
 MODEL_BASE_PATH = os.environ.get("MODEL_BASE_PATH", "s3a://warehouse/models")
@@ -222,6 +223,58 @@ def compute_metrics_row(df: DataFrame, model_version: str, eval_split: str,
     return rows
 
 
+def compute_nasa_test_metrics(spark: SparkSession, model: PipelineModel,
+                              model_version: str, rul_cap: int,
+                              silver_snapshot_id: int, silver_row_count: int):
+    """NASA C-MAPSS 표준 평가.
+
+    test trajectory 의 *마지막 cycle 시점* 예측값과 RUL_FDxxx.txt 정답을 비교.
+    학회/논문 결과 비교의 표준이라 별도 split 으로 model_metrics 에 기록.
+
+    조건: phm.silver.engine_health 에 is_test=true 행 존재 + rul_ground_truth 적재됨.
+    조건 미충족 시 빈 list 반환 (skip).
+    """
+    silver = spark.table(SILVER_TABLE).where(F.col("is_test"))
+    if silver.limit(1).count() == 0:
+        print("[gold_rul_predict.train] NASA test eval skip: silver 에 is_test 행 없음")
+        return []
+
+    try:
+        gt = spark.table(RUL_GROUND_TRUTH_TABLE)
+    except Exception:
+        print(f"[gold_rul_predict.train] NASA test eval skip: {RUL_GROUND_TRUTH_TABLE} 없음")
+        return []
+    if gt.limit(1).count() == 0:
+        print("[gold_rul_predict.train] NASA test eval skip: rul_ground_truth 비어 있음")
+        return []
+
+    # unit 별 마지막 cycle 행 — NASA 평가 시점은 test trajectory 끝
+    w = Window.partitionBy("dataset_id", "unit_id").orderBy(F.col("cycle").desc())
+    last_cycle_df = (
+        silver.withColumn("_rn", F.row_number().over(w))
+              .where(F.col("_rn") == 1)
+              .drop("_rn")
+    )
+    # rolling NaN 채움 (rul_capped 는 join 후 ground truth 로 계산)
+    feat_df = last_cycle_df.na.fill(0.0, subset=["s_std_w5", "s_trend_w5"])
+
+    pred = model.transform(feat_df)
+    joined = (
+        pred.join(gt.select("dataset_id", "unit_id", "true_rul"),
+                  on=["dataset_id", "unit_id"], how="inner")
+            .withColumn("rul_capped",
+                        F.least(F.col("true_rul").cast("double"),
+                                F.lit(float(rul_cap))))
+    )
+    n = joined.count()
+    if n == 0:
+        print("[gold_rul_predict.train] NASA test eval skip: ground truth join 결과 0행")
+        return []
+    print(f"[gold_rul_predict.train] NASA test eval: {n} (dataset, unit) 평가")
+    return compute_metrics_row(joined, model_version, "nasa_test",
+                               silver_snapshot_id, silver_row_count)
+
+
 def merge_model_metrics(spark: SparkSession, rows: list):
     if not rows:
         return
@@ -334,11 +387,14 @@ def write_pipeline_state(spark: SparkSession, *,
 # ─────────────────────── 모드별 실행 ───────────────────────
 
 def run_train(spark: SparkSession, args) -> tuple[str, float]:
-    """unit-level 80/20 → fit → save → metrics. Returns (model_path, holdout_sigma)."""
+    """is_test=False 만 학습 풀로 사용 → unit-level 80/20 → fit → save →
+    train/holdout/nasa_test metrics. Returns (model_path, holdout_sigma)."""
     silver = spark.table(SILVER_TABLE)
-    df = prepare_features(silver, args.rul_cap)
+    train_pool = silver.where(~F.col("is_test"))
+    df = prepare_features(train_pool, args.rul_cap)
     train_df, holdout_df, n_train, n_holdout = unit_level_split(df, seed=42)
-    print(f"[gold_rul_predict.train] split: train_units={n_train}, holdout_units={n_holdout}")
+    print(f"[gold_rul_predict.train] split: train_units={n_train}, "
+          f"holdout_units={n_holdout} (test trajectory 제외)")
 
     print("[gold_rul_predict.train] fitting GBT on train split (no leakage)...")
     model = fit_pipeline(train_df, max_iter=args.max_iter, max_depth=args.max_depth)
@@ -353,7 +409,7 @@ def run_train(spark: SparkSession, args) -> tuple[str, float]:
     print(f"[gold_rul_predict.train] saving model to {model_path}")
     model.write().overwrite().save(model_path)
 
-    # metrics: train + holdout 모두 기록
+    # metrics: train + holdout + (nasa_test 가능 시) 모두 기록
     silver_snap = current_silver_snapshot_id(spark)
     silver_n = silver.count()
 
@@ -365,6 +421,8 @@ def run_train(spark: SparkSession, args) -> tuple[str, float]:
                                 silver_snap, silver_n)
     rows += compute_metrics_row(holdout_pred, args.model_version, "holdout",
                                 silver_snap, silver_n)
+    rows += compute_nasa_test_metrics(spark, model, args.model_version, args.rul_cap,
+                                      silver_snap, silver_n)
     merge_model_metrics(spark, rows)
     print(f"[gold_rul_predict.train] wrote {len(rows)} model_metrics rows")
 

@@ -57,9 +57,9 @@ data/_checkpoints/      Spark streaming checkpoint (호스트 bind mount, down -
 
 ## 모델 / 평가 현황
 
-- `gold_rul_predict.py` — Spark MLlib `GBTRegressor` (`gbt-v0`). 3-mode (`train` / `predict` / `full`). unit-level 80/20 holdout split, MinIO `s3a://warehouse/models/<version>/<ts>/` 에 PipelineModel 저장, 추론은 `pipeline_state.active_model_path` 로드. `model_metrics` 에 `eval_split=train|holdout` 분리 기록.
+- `gold_rul_predict.py` — Spark MLlib `GBTRegressor` (`gbt-v0`). 3-mode (`train` / `predict` / `full`). unit-level 80/20 holdout split, MinIO `s3a://warehouse/models/<version>/<ts>/` 에 PipelineModel 저장, 추론은 `pipeline_state.active_model_path` 로드. `model_metrics` 에 `eval_split = train | holdout | nasa_test` 3종 분리 기록.
 - `experiments/lstm_baseline.py` — PyTorch LSTM (`lstm-v1`). unit-level 80/20 split (위 GBT 와 동일 패턴).
-- **NASA test set + RUL_FD00x.txt 평가는 미적용** (학회용 표준 평가). 추가하려면 producer 의 `--include-test` + Silver 의 `is_test` 플래그 + RUL_FD00x.txt join 필요.
+- **NASA C-MAPSS 표준 평가 적용됨** — producer `--include-test` + silver `is_test` 컬럼 + `phm.silver.rul_ground_truth` (`load_rul_ground_truth.py` 가 RUL_FDxxx.txt 적재) → `gold_rul_predict --mode train` 이 `eval_split='nasa_test'` 행을 자동 생성. 학회/논문 외부 비교 지표 직접 사용 가능.
 - 결과 표 (전체 silver 기준):
   | dataset | GBT v0 MAE | LSTM v1 MAE |
   |---|---|---|
@@ -79,6 +79,7 @@ data/_checkpoints/      Spark streaming checkpoint (호스트 bind mount, down -
 - **Silver 증분 처리**: 매시간 `silver_merge_dag` 가 `--mode incremental` 호출. `phm.silver.pipeline_state.last_snapshot_id` 이후 bronze 변경분만 Iceberg `start-snapshot-id` 옵션으로 스캔, 영향 `(dataset, unit)` 의 모든 cycle 을 재변환 (rolling window + rul_label 정확성). KMeans/cluster 통계는 주 1회 `silver_fit_stats_dag` 가 `phm.silver.feat_stats` 에 갱신.
 - **Gold 학습/추론 분리**: 이전엔 매 run train+predict 동시 (학습 데이터에 추론 = 누수). 분리 후 — `gold_train_dag` (월 07:00, 주 1회) 가 unit-level 80/20 holdout 으로 GBT fit + MinIO 저장 + `model_metrics` 에 train/holdout 분리 기록. `gold_rul_predict_dag` (매시 :15) 는 저장 모델 로드, silver 변경분만 추론. `phm.gold.pipeline_state.active_model_path` 가 활성 모델 포인터. PipelineModel 저장 경로: `s3a://warehouse/models/<version>/<ts>/`.
 - **데이터 품질 vs 운영 메트릭 분리**: `code/health-queries/` (Trino, 매시간) = 인프라 시그널 (snapshot 추이, drift, dropout). `code/pipelines/dq_check.py` (Spark, 매일) = *데이터 자체* (NULL/finite/dup/cycle/rul/cluster/freshness/count/NaN). 같은 대시보드에 섞으면 알람 우선순위 깨짐 — DAG / 테이블 / 대시보드 탭 모두 분리.
+- **NASA 표준 평가 (test trajectory + RUL_FDxxx.txt)**: 학회/논문 외부 비교용. producer `--include-test` 로 test trajectory 도 같은 Kafka 토픽으로 발행, Bronze append → Silver 가 `source_file LIKE 'test_%'` 로 `is_test=True` 도출 + `rul_label=NULL`. `load_rul_ground_truth.py` 가 RUL_FDxxx.txt 를 `phm.silver.rul_ground_truth` 에 적재. `gold_rul_predict --mode train` 이 train pool (`is_test=False`) 으로 학습 후, test 의 *마지막 cycle 시점 예측* vs 정답 RUL 을 `eval_split='nasa_test'` 로 model_metrics 에 자동 기록. 데이터 없으면 skip (graceful degrade).
 
 ## 작업 시 우선 확인할 것
 

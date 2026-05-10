@@ -73,14 +73,20 @@ else
     || { echo "  × 기동 실패 — log:"; docker exec "$SPARK" tail -40 "$LOG_DIR/bronze_ingest.log" 2>&1; exit 1; }
 fi
 
-echo "▶ 5) Kafka producer — FD001~FD004 전체 (Time-Travel: base=2025-08-01, 1 cycle = 1h)"
+echo "▶ 5) Kafka producer — FD001~FD004 전체 train + test (NASA 표준 평가용)"
 docker exec -i "$SPARK" python3 /workspace/code/pipelines/cmaps_to_kafka.py \
   --datasets FD001,FD002,FD003,FD004 \
+  --include-test \
   --base-date 2025-08-01 \
   --interval 1h \
   --unit-jitter 1h \
   --cycle-interval 1 \
   --speedup 1000
+
+echo "▶ 5b) RUL_FDxxx.txt → phm.silver.rul_ground_truth (NASA 정답 RUL)"
+docker exec -i "$SPARK" /opt/spark/bin/spark-submit --master 'local[*]' \
+  /workspace/code/pipelines/load_rul_ground_truth.py \
+  --datasets FD001,FD002,FD003,FD004
 
 echo "▶ 6) Streaming 소화 대기 (60s)"
 sleep 60
@@ -107,13 +113,24 @@ echo "▶ 10) Gold KPI 일배치"
 docker exec -i "$SPARK" /opt/spark/bin/spark-submit --master 'local[*]' \
   /workspace/code/pipelines/gold_kpi_aggregate.py
 
-echo "▶ 11) 최종 검증"
+echo "▶ 11) 최종 검증 (레이어 카운트 + NASA 평가 결과)"
 docker exec -i "$SPARK" /opt/spark/bin/spark-sql \
   --conf spark.sql.defaultCatalog=phm \
-  -e "SELECT 'bronze' AS layer, COUNT(*) FROM phm.bronze.engine_sensor_raw
-      UNION ALL SELECT 'silver', COUNT(*) FROM phm.silver.engine_health
-      UNION ALL SELECT 'gold.rul', COUNT(*) FROM phm.gold.rul_prediction
-      UNION ALL SELECT 'gold.kpi', COUNT(*) FROM phm.gold.fleet_kpi_daily;"
+  -e "SELECT 'bronze' AS layer, COUNT(*) AS n FROM phm.bronze.engine_sensor_raw
+      UNION ALL SELECT 'silver',                COUNT(*) FROM phm.silver.engine_health
+      UNION ALL SELECT 'silver(is_test)',       COUNT(*) FROM phm.silver.engine_health WHERE is_test
+      UNION ALL SELECT 'silver.rul_ground_truth', COUNT(*) FROM phm.silver.rul_ground_truth
+      UNION ALL SELECT 'gold.rul',              COUNT(*) FROM phm.gold.rul_prediction
+      UNION ALL SELECT 'gold.kpi',              COUNT(*) FROM phm.gold.fleet_kpi_daily;"
+
+echo "▶ 11b) NASA 표준 평가 (eval_split='nasa_test') — 학회/논문 결과 표"
+docker exec -i "$SPARK" /opt/spark/bin/spark-sql \
+  --conf spark.sql.defaultCatalog=phm \
+  -e "SELECT model_version, dataset_id, sample_count,
+             ROUND(mae, 2) AS mae, ROUND(rmse, 2) AS rmse, ROUND(phm08_score, 2) AS phm08
+        FROM phm.gold.model_metrics
+       WHERE eval_split = 'nasa_test'
+       ORDER BY model_version, dataset_id;"
 
 echo "✓ 전체 적재 완료. Bronze streaming 은 계속 실행 중."
 echo "  중지: docker exec $SPARK pkill -f bronze_ingest.py"

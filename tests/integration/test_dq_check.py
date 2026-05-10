@@ -59,7 +59,7 @@ def _create_tables(spark):
             op_condition_cluster INT,
             {norm_cols},
             s_avg_w5 DOUBLE, s_std_w5 DOUBLE, s_trend_w5 DOUBLE,
-            health_index DOUBLE, rul_label INT,
+            health_index DOUBLE, rul_label INT, is_test BOOLEAN,
             event_ts TIMESTAMP, ingest_ts TIMESTAMP, silver_ts TIMESTAMP,
             silver_version STRING
         )
@@ -154,7 +154,7 @@ def _seed_silver_from_bronze(spark, n_units=2, n_cycles=10):
                 "op_condition_cluster": 0,
                 **{f"s{s}_norm": 0.0 for s in st.KEEP_SENSORS},
                 "s_avg_w5": 0.0, "s_std_w5": 0.0, "s_trend_w5": 0.0,
-                "health_index": 1.0, "rul_label": max_c - c,
+                "health_index": 1.0, "rul_label": max_c - c, "is_test": False,
                 "event_ts": datetime(2025, 8, 1, tzinfo=timezone.utc),
                 "ingest_ts": datetime(2025, 8, 1, tzinfo=timezone.utc),
                 "silver_ts": datetime.now(tz=timezone.utc),
@@ -168,7 +168,7 @@ def _seed_silver_from_bronze(spark, n_units=2, n_cycles=10):
         "op_condition_cluster",
         *(f"s{s}_norm" for s in st.KEEP_SENSORS),
         "s_avg_w5", "s_std_w5", "s_trend_w5",
-        "health_index", "rul_label",
+        "health_index", "rul_label", "is_test",
         "event_ts", "ingest_ts", "silver_ts", "silver_version",
     ]
     df = df.select(
@@ -185,6 +185,7 @@ def _seed_silver_from_bronze(spark, n_units=2, n_cycles=10):
         F.col("s_trend_w5").cast("double"),
         F.col("health_index").cast("double"),
         F.col("rul_label").cast("int"),
+        F.col("is_test").cast("boolean"),
         F.col("event_ts").cast("timestamp"),
         F.col("ingest_ts").cast("timestamp"),
         F.col("silver_ts").cast("timestamp"),

@@ -22,6 +22,7 @@ from silver_transform import (
     KEEP_SENSORS,
     TARGET_COLS,
     add_health_index,
+    add_is_test_flag,
     add_rolling_features,
     add_rul_label,
     cluster_op_conditions,
@@ -48,6 +49,7 @@ def _create_silver_table(spark):
             s_trend_w5           DOUBLE,
             health_index         DOUBLE,
             rul_label            INT,
+            is_test              BOOLEAN,
             event_ts             TIMESTAMP,
             ingest_ts            TIMESTAMP,
             silver_ts            TIMESTAMP,
@@ -103,6 +105,7 @@ def _silver_transform(spark, bronze):
         )
     df = add_rolling_features(df, [f"s{s}_norm" for s in KEEP_SENSORS], window=5)
     df = add_health_index(df)
+    df = add_is_test_flag(df)
     df = add_rul_label(df)
     df = (
         df.withColumn("silver_ts", F.current_timestamp())

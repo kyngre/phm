@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from cmaps_to_kafka import parse_interval, parse_line, synth_event_ts
+from cmaps_to_kafka import iter_dataset, parse_interval, parse_line, synth_event_ts
 
 
 class TestParseInterval:
@@ -114,3 +114,45 @@ class TestSynthEventTs:
             interval=timedelta(minutes=5), unit_jitter=timedelta(0),
         )
         assert ts == "2025-08-01T01:00:00.000Z"  # 12 cycle × 5m = 60m
+
+
+class TestIterDatasetSource:
+    """--include-test 의 핵심 — source 파라미터로 train/test 파일 분기."""
+
+    def _write_fake_data(self, tmp_path, source: str, dataset_id: str = "FD001",
+                         n_units: int = 2, n_cycles: int = 3):
+        """26 컬럼 더미 데이터를 train_FDxxx.txt 또는 test_FDxxx.txt 형식으로 생성."""
+        path = tmp_path / f"{source}_{dataset_id}.txt"
+        lines = []
+        for u in range(1, n_units + 1):
+            for c in range(1, n_cycles + 1):
+                vals = [str(u), str(c)] + ["0.0"] * 24
+                lines.append(" ".join(vals))
+        path.write_text("\n".join(lines) + "\n")
+        return path
+
+    def test_source_train_emits_train_file_marker(self, tmp_path, monkeypatch):
+        import cmaps_to_kafka
+        self._write_fake_data(tmp_path, "train")
+        monkeypatch.setattr(cmaps_to_kafka, "DATA_DIR", tmp_path)
+        recs = list(iter_dataset("FD001", max_units=None, source="train"))
+        assert len(recs) == 6  # 2 unit × 3 cycle
+        assert all(r["source_file"] == "train_FD001.txt" for r in recs)
+
+    def test_source_test_emits_test_file_marker(self, tmp_path, monkeypatch):
+        """source='test' → source_file='test_FDxxx.txt' (Silver dedup_bronze 후
+        is_test = source_file LIKE 'test_%' 의 입력)."""
+        import cmaps_to_kafka
+        self._write_fake_data(tmp_path, "test")
+        monkeypatch.setattr(cmaps_to_kafka, "DATA_DIR", tmp_path)
+        recs = list(iter_dataset("FD001", max_units=None, source="test"))
+        assert len(recs) == 6
+        assert all(r["source_file"] == "test_FD001.txt" for r in recs)
+
+    def test_source_default_is_train_backward_compat(self, tmp_path, monkeypatch):
+        """source 인자 생략 → 'train' (기본). 기존 호출 호환."""
+        import cmaps_to_kafka
+        self._write_fake_data(tmp_path, "train")
+        monkeypatch.setattr(cmaps_to_kafka, "DATA_DIR", tmp_path)
+        recs = list(iter_dataset("FD001", max_units=None))
+        assert all(r["source_file"] == "train_FD001.txt" for r in recs)

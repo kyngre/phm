@@ -16,7 +16,7 @@
 | `test_FD00x.txt` | partial trajectory (평가) | 13K~41K | 동일 |
 | `RUL_FD00x.txt` | test 의 마지막 cycle 시점 정답 RUL | 100~249 | 1 col |
 
-> **파이프라인 vs 실험 파일 분리**: `full_ingest.sh` 및 Kafka 시뮬레이터는 **train 파일만** 사용 (run-to-failure 궤적 전체가 있어야 `rul_label = max_cycle − cycle` 계산 가능). `test_FD00x.txt`·`RUL_FD00x.txt` 는 `experiments/lstm_baseline.py` 에서 hold-out 평가용으로 별도 소비함.
+> **3종 파일의 사용처**: `full_ingest.sh` + Kafka 시뮬레이터는 `--include-test` 로 **train + test 모두** 발행 (Bronze → Silver `is_test` 플래그로 분리). `RUL_FD00x.txt` 는 별도 `code/pipelines/load_rul_ground_truth.py` 가 `phm.silver.rul_ground_truth` 로 적재. **NASA 표준 평가** (`eval_split='nasa_test'`) 가 `gold_rul_predict --mode train` 에서 자동 산출되어 `phm.gold.model_metrics` 에 기록됨. 학회/논문 결과 비교에 직접 사용.
 
 데이터는 [NASA Prognostics CoE Data Repository](https://www.nasa.gov/intelligent-systems-division/discovery-and-systems-health/pcoe/pcoe-data-set-repository/) 의 *Turbofan Engine Degradation Simulation Data Set* 에서 받아 `data/raw/` 에 풀어 넣는다 (`train_FD001.txt` ~ `RUL_FD004.txt` 12개 파일). `data/raw/` 는 [.gitignore](.gitignore) 대상.
 
@@ -151,9 +151,11 @@ event_ts = base_date  +  unit_jitter × unit_id  +  interval × (cycle − 1)
   | `phm.gold.model_metrics` | 모델 버전 × split (train / holdout / operational) × dataset 별 MAE / RMSE / PHM08 | `(model_version)` | `(model_version, dataset_id, eval_window_end, eval_split)` |
   | `phm.gold.dq_results` | 데이터 품질 검증 결과 (NULL/finite/dup/cycle/rul/cluster/freshness/count/NaN; §5-2) | `(run_date)` | `(rule_name, layer, dataset_id, run_date)` |
   | `phm.gold.pipeline_state` | 추론 watermark + active 모델 경로 (학습/추론 분리) | — | `(pipeline_name)` |
+  | `phm.silver.rul_ground_truth` | RUL_FDxxx.txt 정답 RUL (test trajectory 의 마지막 cycle 시점) — NASA 표준 평가 입력 | `(dataset_id)` | `(dataset_id, unit_id)` |
 
 - **모델 — 학습/추론 분리** (B 프레이밍, 운영 시스템 패턴):
-  - `gold_train_dag` (월 07:00, 주 1회): unit-level **80/20 holdout split** 으로 GBT 학습 → MinIO `s3a://warehouse/models/<model_version>/<ts>/` 에 PipelineModel 저장 → `model_metrics` 에 `train` / `holdout` 분리 기록 (정직한 일반화 성능) → `pipeline_state.active_model_path` 갱신.
+  - `gold_train_dag` (월 07:00, 주 1회): `is_test=False` (train trajectory) 만 학습 풀로 사용 → unit-level **80/20 holdout split** 으로 GBT 학습 → MinIO `s3a://warehouse/models/<model_version>/<ts>/` 에 PipelineModel 저장 → `model_metrics` 에 `train` / `holdout` / `nasa_test` (※) 분리 기록 → `pipeline_state.active_model_path` 갱신.
+    - ※ `nasa_test`: `is_test=True` (test trajectory) 의 *마지막 cycle 시점* 예측을 `silver.rul_ground_truth.true_rul` (RUL_FDxxx.txt) 와 비교한 **NASA 표준 평가**. 외부 비교 가능한 학회/논문용 지표. 데이터 없으면 자동 skip.
   - `gold_rul_predict_dag` (매시 :15): `pipeline_state.active_model_path` 에서 PipelineModel 로드 → silver 변경분 + 영향 unit 의 모든 cycle 추론 → `rul_prediction` MERGE. **재학습 X**.
   - 이전 설계 (매 run train+predict 동시) 는 *데이터 누수* (train 데이터에서 추론) 였음 — `experiments/lstm_baseline.py` 가 보여주는 정직한 80/20 split 패턴을 운영 GBT 도 따르도록 정렬.
 - **모델 비교**: 학술 비교용 LSTM/CNN 은 `experiments/lstm_baseline.py` (별도 실행). 같은 `model_metrics` 테이블에 다른 `model_version` 으로 적재되어 SQL 한 줄 비교.

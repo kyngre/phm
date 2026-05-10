@@ -23,6 +23,7 @@ from pyspark.sql import functions as F
 from silver_transform import (
     KEEP_SENSORS,
     add_health_index,
+    add_is_test_flag,
     add_rolling_features,
     add_rul_label,
     apply_zscore_from_stats,
@@ -339,17 +340,49 @@ class TestApplyZscoreFromStats:
             assert out[0][f"s{s}_norm"] == 0.0
 
 
-# ──────────────── 7) add_rul_label ────────────────
+# ──────────────── 7) add_is_test_flag (NASA test 분류) ────────────────
+
+
+class TestAddIsTestFlag:
+    def test_train_source_file_is_false(self, spark):
+        df = spark.createDataFrame(
+            [("train_FD001.txt",), ("train_FD002.txt",)],
+            ["source_file"],
+        )
+        out = {r["source_file"]: r["is_test"] for r in add_is_test_flag(df).collect()}
+        assert out == {"train_FD001.txt": False, "train_FD002.txt": False}
+
+    def test_test_source_file_is_true(self, spark):
+        df = spark.createDataFrame(
+            [("test_FD001.txt",), ("test_FD004.txt",)],
+            ["source_file"],
+        )
+        out = {r["source_file"]: r["is_test"] for r in add_is_test_flag(df).collect()}
+        assert out == {"test_FD001.txt": True, "test_FD004.txt": True}
+
+    def test_missing_source_file_column_falls_back_to_false(self, spark):
+        """source_file 컬럼이 없는 df 는 안전망으로 is_test=False (모두 train 으로 가정)."""
+        df = spark.createDataFrame([(1,)], ["unit_id"])
+        out = add_is_test_flag(df).collect()
+        assert out[0]["is_test"] is False
+
+
+# ──────────────── 8) add_rul_label ────────────────
 
 
 class TestAddRulLabel:
     def test_max_cycle_minus_cycle_per_engine(self, spark):
+        """train trajectory (is_test=False): rul_label = max(cycle) - cycle."""
+        from pyspark.sql import functions as F
         rows = [
             ("FD001", 1, 1), ("FD001", 1, 2), ("FD001", 1, 3),
             ("FD001", 2, 1), ("FD001", 2, 2),  # unit 2 의 max 는 2
             ("FD002", 1, 1), ("FD002", 1, 5),  # 다른 dataset → 분리
         ]
-        df = spark.createDataFrame(rows, ["dataset_id", "unit_id", "cycle"])
+        df = (
+            spark.createDataFrame(rows, ["dataset_id", "unit_id", "cycle"])
+                 .withColumn("is_test", F.lit(False))
+        )
         out = {(r["dataset_id"], r["unit_id"], r["cycle"]): r["rul_label"]
                for r in add_rul_label(df).collect()}
         # FD001 unit 1: max=3 → rul = 2,1,0
@@ -362,3 +395,13 @@ class TestAddRulLabel:
         # FD002 unit 1: max=5 → 4, 0
         assert out[("FD002", 1, 1)] == 4
         assert out[("FD002", 1, 5)] == 0
+
+    def test_test_trajectory_rul_label_is_null(self, spark):
+        """test trajectory (is_test=True): rul_label = NULL (정답은 ground truth 별도)."""
+        from pyspark.sql import functions as F
+        rows = [("FD001", 1, 1, True), ("FD001", 1, 2, True)]
+        df = spark.createDataFrame(rows, ["dataset_id", "unit_id", "cycle", "is_test"])
+        out = add_rul_label(df).collect()
+        for r in out:
+            assert r["rul_label"] is None, \
+                f"is_test=True 인데 rul_label={r['rul_label']}"

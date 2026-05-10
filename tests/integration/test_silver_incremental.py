@@ -61,7 +61,7 @@ def _create_tables(spark):
             op_condition_cluster INT,
             {NORM_COLS},
             s_avg_w5 DOUBLE, s_std_w5 DOUBLE, s_trend_w5 DOUBLE,
-            health_index DOUBLE, rul_label INT,
+            health_index DOUBLE, rul_label INT, is_test BOOLEAN,
             event_ts TIMESTAMP, ingest_ts TIMESTAMP, silver_ts TIMESTAMP,
             silver_version STRING
         )
