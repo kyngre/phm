@@ -57,5 +57,5 @@ TBLPROPERTIES (
     'write.merge.mode' = 'copy-on-write',
     'write.update.mode' = 'copy-on-write',
     'write.delete.mode' = 'copy-on-write',
-    'history.expire.max-snapshot-age-ms' = '7776000000'
+    'history.expire.max-snapshot-age-ms' = '8640000000'  -- 100일 (학습 윈도우 90d + 마진 10d)
 );

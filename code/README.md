@@ -67,7 +67,7 @@ Trino에서 실행하는 운영 헬스 쿼리 8개. 각 파일이 하나의 점�
 | `01_sensor_dropout.sql` | 엔진별 마지막 데이터 도착 시각 | gap > 30분 → Producer 점검 |
 | `02_daily_volume.sql` | 일자별 행 수 추이 | 어제 대비 ±50% → 알림 |
 | `03_small_files_ratio.sql` | Iceberg 작은 파일 비율 | > 30% → `rewrite_data_files` 트리거 |
-| `04_snapshot_growth.sql` | snapshot 누적 개수 | 90일 초과 → `expire_snapshots` 트리거 |
+| `04_snapshot_growth.sql` | snapshot 누적 개수 | 100일 초과 → `expire_snapshots` 트리거 |
 | `05_rul_mae_drift.sql` | RUL 예측 MAE 추이 | 7일 이동평균 +20% → 모델 재학습 |
 | `06_silver_merge_conflicts.sql` | Silver MERGE 충돌 · 재시도 빈도 | replace 비율 급증 → 점검 |
 | `07_op_condition_drift.sql` | 운영조건 클러스터 분포 변화 | \|Δpct\| > 0.05 → data drift |
@@ -96,7 +96,7 @@ Airflow `health_check_dag`에서 매일 자동 실행. 자세한 내용은 [heal
 |---|---|---|---|
 | `01_rewrite_data_files.sql` | 작은 파일 → 128MB로 합침 (compaction) | 일 1회 | `health-queries/03` > 30% |
 | `02_rewrite_manifests.sql` | 메타데이터 매니페스트 정리 | 주 1회 | metadata read 지연 시 |
-| `03_expire_snapshots.sql` | 90일 지난 snapshot 삭제 | 주 1회 | snapshot 수 누적 |
+| `03_expire_snapshots.sql` | 100일 지난 snapshot 삭제 (백필 90d + 마진 10d) | 주 1회 | snapshot 수 누적 |
 | `04_remove_orphan_files.sql` | 실패한 write가 남긴 고아 파일 삭제 | 월 1회 | 실패한 write/컴팩션 후 |
 
 ```bash

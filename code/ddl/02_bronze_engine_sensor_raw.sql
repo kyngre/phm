@@ -42,5 +42,5 @@ TBLPROPERTIES (
     'write.metadata.delete-after-commit.enabled' = 'true',
     'write.metadata.previous-versions-max' = '20',
     'history.expire.min-snapshots-to-keep' = '20',
-    'history.expire.max-snapshot-age-ms' = '7776000000'    -- 90일
+    'history.expire.max-snapshot-age-ms' = '8640000000'    -- 100일 (학습 윈도우 90d + 마진 10d). orchestration/dags/iceberg_expire_dag.py 와 동기화.
 );

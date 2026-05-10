@@ -4,6 +4,10 @@
 운영에서는 SQL 을 jinja-render 하거나, 절차 호출을 BashOperator 안에서 동적으로 조합하는 게
 정석이지만 — 여기서는 단순화 위해 SQL 파일을 그대로 호출하고, 주기적으로 SQL 의
 older_than 을 갱신하는 방침으로 둔다(주석 형태로 명시).
+
+OLDER_THAN_DAYS = 100 = 학습 윈도우(README §8-2: 90일 백필) + 안전 마진 10일.
+DDL `history.expire.max-snapshot-age-ms` (= 8_640_000_000 ms = 100일) 와 동기화 필요 —
+어긋나면 tests/dags/test_backfill_safety.py::test_table_ddl_max_snapshot_age_matches 가 fail.
 """
 from __future__ import annotations
 
@@ -14,7 +18,7 @@ from airflow.operators.bash import BashOperator
 
 from _common import DEFAULT_ARGS, SPARK_CONTAINER
 
-OLDER_THAN_DAYS = 90
+OLDER_THAN_DAYS = 100
 RETAIN_LAST = 20
 
 # 동적 expire — SQL 파일 대신 인라인으로 매 실행마다 절대 시각 계산.

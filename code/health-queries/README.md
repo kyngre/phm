@@ -5,7 +5,7 @@
 | 1 | `01_sensor_dropout.sql` | 엔진별 마지막 ingest 시각 | gap > 30분 → 시뮬레이터/Producer 점검 |
 | 2 | `02_daily_volume.sql` | dataset×cluster 일자 행수 | 어제 대비 ±50% → 알림 |
 | 3 | `03_small_files_ratio.sql` | <128MB 파일 비율 | > 30% → `rewrite_data_files` 트리거 |
-| 4 | `04_snapshot_growth.sql` | snapshot 개수·기간 | 90일 초과 → `expire_snapshots` |
+| 4 | `04_snapshot_growth.sql` | snapshot 개수·기간 | 100일 초과 → `expire_snapshots` |
 | 5 | `05_rul_mae_drift.sql` | 모델 일자 MAE/RMSE/PHM08 | MAE 7일 이동평균 +20% → 재학습 |
 | 6 | `06_silver_merge_conflicts.sql` | Silver commit 패턴 | replace 비율 ↑ 또는 빈 commit → 점검 |
 | 7 | `07_op_condition_drift.sql` | cluster 분포 7일 변화 | \|Δpct\| > 0.05 → data drift |

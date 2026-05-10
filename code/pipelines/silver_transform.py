@@ -50,6 +50,67 @@ def stable_cluster_ids(model_centers, prediction_col_df, prediction_col):
     )
 
 
+def cluster_op_conditions(bronze_df, k: int = 6, seed: int = 42):
+    """op_setting 1~3 → KMeans(k, seed) → stable_cluster_ids 적용.
+
+    main() 과 unit test 가 같은 진입점을 쓰도록 분리. seed 가 고정돼 있어도
+    cluster ID 자체는 매 fit 마다 swap 될 수 있어 stable_cluster_ids 가 필요.
+    """
+    assembler = VectorAssembler(
+        inputCols=["op_setting_1", "op_setting_2", "op_setting_3"],
+        outputCol="op_vec",
+    )
+    bronze_v = assembler.transform(bronze_df)
+    kmeans = KMeans(
+        k=k, seed=seed,
+        featuresCol="op_vec", predictionCol="op_condition_cluster",
+    )
+    model = kmeans.fit(bronze_v)
+    df = model.transform(bronze_v).drop("op_vec")
+    return stable_cluster_ids(model.clusterCenters(), df, "op_condition_cluster"), model
+
+
+def add_rolling_features(df, sensor_cols, window: int = 5):
+    """engine timeline 5-cycle rolling: s_avg_w5 / s_std_w5 / s_trend_w5.
+
+    norm 컬럼들의 행 평균을 _s_row_mean 으로 만든 뒤 unit timeline 을 따라
+    rolling. trend 는 window 내 첫 행 대비 현재값 / (w-1) — 기울기 비례.
+    """
+    engine_w = (
+        Window.partitionBy("dataset_id", "unit_id")
+        .orderBy("cycle")
+        .rowsBetween(-(window - 1), 0)
+    )
+    norm_cols = [F.col(c) for c in sensor_cols]
+    s_row_mean = sum(norm_cols) / F.lit(len(norm_cols))
+    df = df.withColumn("_s_row_mean", s_row_mean)
+    df = df.withColumn("s_avg_w5", F.avg("_s_row_mean").over(engine_w))
+    df = df.withColumn("s_std_w5", F.stddev_samp("_s_row_mean").over(engine_w))
+    first_in_w = F.first("_s_row_mean").over(engine_w)
+    df = df.withColumn(
+        "s_trend_w5",
+        (F.col("_s_row_mean") - first_in_w) / F.lit(max(window - 1, 1)),
+    )
+    return df
+
+
+def add_health_index(df, src_col: str = "s_avg_w5"):
+    """HI = 1 − min(|src|, 3) / 3. z=0(클러스터 평균) → 1, |z|≥3 → 0."""
+    return df.withColumn(
+        "health_index",
+        F.lit(1.0) - F.least(F.abs(F.col(src_col)), F.lit(3.0)) / F.lit(3.0),
+    )
+
+
+def add_rul_label(df):
+    """train 가정: 마지막 cycle = 고장. rul_label = max(cycle) - cycle (per engine)."""
+    engine_all_w = Window.partitionBy("dataset_id", "unit_id")
+    return df.withColumn(
+        "rul_label",
+        F.max("cycle").over(engine_all_w) - F.col("cycle"),
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--silver-version", default="v1")
@@ -64,19 +125,8 @@ def main():
 
     bronze = spark.table("phm.bronze.engine_sensor_raw")
 
-    # 1) op_condition_cluster
-    assembler = VectorAssembler(
-        inputCols=["op_setting_1", "op_setting_2", "op_setting_3"],
-        outputCol="op_vec",
-    )
-    bronze_v = assembler.transform(bronze)
-    kmeans = KMeans(
-        k=args.kmeans_k, seed=42,
-        featuresCol="op_vec", predictionCol="op_condition_cluster",
-    )
-    model = kmeans.fit(bronze_v)
-    df = model.transform(bronze_v).drop("op_vec")
-    df = stable_cluster_ids(model.clusterCenters(), df, "op_condition_cluster")
+    # 1) op_condition_cluster (KMeans + stable id)
+    df, _model = cluster_op_conditions(bronze, k=args.kmeans_k, seed=42)
 
     # 2) 센서 z-score (cluster 별)
     cluster_w = Window.partitionBy("dataset_id", "op_condition_cluster")
@@ -89,35 +139,11 @@ def main():
             F.when(sd > 0, (F.col(col) - m) / sd).otherwise(F.lit(0.0)),
         )
 
-    # 3) rolling 피처 (engine timeline)
-    w = args.rolling_window
-    engine_w = (
-        Window.partitionBy("dataset_id", "unit_id")
-        .orderBy("cycle")
-        .rowsBetween(-(w - 1), 0)
-    )
-    norm_cols = [F.col(f"s{s}_norm") for s in KEEP_SENSORS]
-    s_row_mean = sum(norm_cols) / F.lit(len(norm_cols))
-    df = df.withColumn("_s_row_mean", s_row_mean)
-    df = df.withColumn("s_avg_w5", F.avg("_s_row_mean").over(engine_w))
-    df = df.withColumn("s_std_w5", F.stddev_samp("_s_row_mean").over(engine_w))
-    # 추세: window 내 첫 행 대비 현재 (∝ 기울기 × (w-1))
-    first_in_w = F.first("_s_row_mean").over(engine_w)
-    df = df.withColumn(
-        "s_trend_w5",
-        (F.col("_s_row_mean") - first_in_w) / F.lit(max(w - 1, 1)),
-    )
-
-    # 4) Health Index — cluster 평균(z=0) 에서 멀수록 열화. 정규화 [0,1].
-    df = df.withColumn(
-        "health_index",
-        F.lit(1.0) - F.least(F.abs(F.col("s_avg_w5")), F.lit(3.0)) / F.lit(3.0),
-    )
-
-    # 5) rul_label
-    engine_all_w = Window.partitionBy("dataset_id", "unit_id")
-    df = df.withColumn("rul_label",
-                       F.max("cycle").over(engine_all_w) - F.col("cycle"))
+    # 3) rolling / 4) HI / 5) rul_label
+    df = add_rolling_features(df, [f"s{s}_norm" for s in KEEP_SENSORS],
+                              window=args.rolling_window)
+    df = add_health_index(df)
+    df = add_rul_label(df)
 
     # 6) silver_ts / version + 컬럼 정렬
     df = (

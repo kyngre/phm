@@ -207,7 +207,7 @@ event_ts = base_date  +  unit_jitter × unit_id  +  interval × (cycle − 1)
 ## 8. 장애·운영 시나리오
 
 1. **Streaming OOM**: `full_ingest.sh`가 DDL 재적용 직후 Bronze checkpoint를 자동 삭제(step 3.5)하므로 스크립트 재실행으로 복구 가능. 수동 복구 시 `data/_checkpoints/bronze_engine_sensor_raw/` 삭제 후 재기동. Bronze 멱등키 `(source_file, line_no)` 덕분에 중복 적재 없음.
-2. **3개월 백필**: producer를 아래 커맨드로 재실행 → Silver MERGE → Gold 재집계. 같은 자연키(dataset/unit/cycle)면 UPDATE, event_ts 만 바뀜. expire 정책이 학습 윈도우(예: 90일)를 침범하지 않도록 보호.
+2. **3개월 백필**: producer를 아래 커맨드로 재실행 → Silver MERGE → Gold 재집계. 같은 자연키(dataset/unit/cycle)면 UPDATE, event_ts 만 바뀜. **expire 정책 = 100일 (학습 윈도우 90d + 안전 마진 10d)** — Bronze/Silver DDL `history.expire.max-snapshot-age-ms = 8_640_000_000` 와 `iceberg_expire_dag.OLDER_THAN_DAYS = 100` 두 곳에 동기화. `tests/dags/test_backfill_safety.py` 가 두 값의 일치와 마진 ≥ 7d 를 강제.
    ```bash
    # Linux/WSL
    --base-date $(date -d '90 days ago' +%F) --interval 1d

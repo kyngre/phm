@@ -1,4 +1,4 @@
--- 4) snapshot 증가율 — expire 정책 점검 (90일 보관 + 최소 20개 유지).
+-- 4) snapshot 증가율 — expire 정책 점검 (100일 보관 + 최소 20개 유지).
 SELECT
     'bronze.engine_sensor_raw' AS table_name,
     COUNT(*)              AS snapshot_count,
