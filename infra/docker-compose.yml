@@ -43,6 +43,17 @@ services:
       "
     networks: [phm]
 
+  # Iceberg REST 볼륨 권한 초기화 — uid 1000(iceberg) 로 chown.
+  # named volume 은 기본 root:root → SQLite catalog.db 생성 실패(SQLITE_CANTOPEN) 회피.
+  iceberg-rest-init:
+    image: alpine:3.20
+    container_name: phm-iceberg-rest-init
+    restart: "no"
+    entrypoint: ["sh", "-c", "chown -R 1000:1000 /var/lib/iceberg-rest"]
+    volumes:
+      - iceberg-rest-data:/var/lib/iceberg-rest
+    networks: [phm]
+
   # ─────────────────────────────────────────────
   # Iceberg REST Catalog (HMS 대체 — arm64 네이티브, 단일 컨테이너)
   # ─────────────────────────────────────────────
@@ -52,6 +63,8 @@ services:
     depends_on:
       minio:
         condition: service_healthy
+      iceberg-rest-init:
+        condition: service_completed_successfully
     ports:
       - "8181:8181"
     environment:
