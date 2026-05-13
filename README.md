@@ -284,7 +284,7 @@ DAG: `dq_check_dag` — 매일 01:00 (gold_kpi 30분 후, compaction 2시간 전
 | Single Spark Streaming Job | Kafka 파티션 수 ↑ + Spark executor 수평 확장, dataset_id 별 job 분리 |
 | 작은 파일 폭증 | 컴팩션 빈도 ↑ + `write.target-file-size-bytes` 튜닝, partial-progress 활성화 |
 | 메타 카탈로그 부하 | 현재 단일 REST Catalog 컨테이너 → Nessie 등 분산·HA 카탈로그로 전환 검토 |
-| 백필 비용 | Silver `days(event_ts)` 파티션 활용 + month 단위로 더 잘게 쪼개기 (`months(event_ts)`) |
+| 파티션 폭증·핫스팟 | Silver `days(event_ts) → hours(event_ts)` 로 잘게 + `bucket(unit_id)` 추가로 write 분산 |
 | 모델 서빙 | 배치 → 온라인 서빙(SageMaker/Triton), Gold에 `predict_ts` 컬럼 추가·`(model_version, dataset_id, unit_id, cycle)` 멱등 키 유지 |
 
 ---
